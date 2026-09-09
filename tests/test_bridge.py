@@ -141,6 +141,35 @@ class SessionFlow(unittest.TestCase):
         st, _, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {})
         self.assertEqual(st, 410)  # old owner was released
 
+    def test_takeover_of_paused_owner_despite_heartbeats(self):
+        # A paused tab keeps heartbeating (so it is not idle-released) but must
+        # still become takeover-able; an unpaused heartbeat resets that clock.
+        self.h.close()
+        self.h = BridgeHarness({"session": {"heartbeat_idle_s": 5, "takeover_idle_s": 0.4, "stream_linger_s": 0.6, "reaper_interval_s": 0.1}})
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        for _ in range(3):
+            time.sleep(0.2)
+            st, _, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {"time": 1, "paused": True})
+            self.assertEqual(st, 200)
+        st, busy, _ = h.call("POST", "/session", {"scene_id": "2"})
+        self.assertEqual(st, 409)
+        self.assertTrue(busy["takeover_available"], busy)  # paused 0.6s > takeover_idle_s, heartbeats notwithstanding
+        self.assertTrue(busy["paused"]); self.assertLess(busy["idle_seconds"], 0.4)
+        # an unpaused heartbeat means the owner is watching again: no takeover
+        st, _, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {"time": 2, "paused": False})
+        st, busy2, _ = h.call("POST", "/session", {"scene_id": "2"})
+        self.assertEqual(st, 409); self.assertFalse(busy2["takeover_available"], busy2)
+        st, denied, _ = h.call("POST", "/session", {"scene_id": "2", "force": True})
+        self.assertEqual(st, 409, denied)
+        # pause again, wait, and the takeover goes through
+        h.call("POST", f"/session/{a['token']}/heartbeat", {"time": 2, "paused": True})
+        time.sleep(0.5)
+        st, b, _ = h.call("POST", "/session", {"scene_id": "2", "force": True})
+        self.assertEqual(st, 200, b)
+        st, _, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {})
+        self.assertEqual(st, 410)
+
     def test_presets_reports_warmth(self):
         st, p, _ = self.h.call("GET", "/presets")
         self.assertEqual(st, 200); self.assertFalse(p["warm"])

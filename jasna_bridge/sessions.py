@@ -44,6 +44,10 @@ class Session:
     client: str
     created: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
+    # Last sign of actual watching: a segment fetch or an unpaused heartbeat.
+    # A paused tab keeps heartbeating (last_activity fresh, so it is not
+    # idle-released) but should count as idle for takeover.
+    last_watch: float = field(default_factory=time.monotonic)
     last_heartbeat: float | None = None
     time: float = 0.0
     paused: bool = False
@@ -51,6 +55,9 @@ class Session:
 
     def idle_seconds(self, now: float | None = None) -> float:
         return (now or time.monotonic()) - self.last_activity
+
+    def watch_idle_seconds(self, now: float | None = None) -> float:
+        return (now or time.monotonic()) - self.last_watch
 
     def public(self, idle_limit: float) -> dict:
         now = time.monotonic()
@@ -60,6 +67,7 @@ class Session:
             "preset": self.preset,
             "owner_since": round(now - self.created, 1),
             "idle_seconds": round(self.idle_seconds(now), 1),
+            "watch_idle_seconds": round(self.watch_idle_seconds(now), 1),
             "idle_limit": idle_limit,
             "time": self.time,
             "paused": self.paused,
@@ -149,13 +157,18 @@ class SessionManager:
                             "takeover_available": False})
             if self.current:
                 idle = self.current.idle_seconds(now)
+                # Takeover keys off watching, not heartbeats: seen 2026-09-09, a
+                # paused phone heartbeating every 30s was only "idle" for the last
+                # 10s of each cycle, so TAKE OVER? appeared or not by luck.
+                watch_idle = self.current.watch_idle_seconds(now)
                 if idle >= self.cfg.heartbeat_idle_s:
                     self._release(self.current, "idle (pre-empted)")
-                elif force and idle >= self.cfg.takeover_idle_s:
-                    self._release(self.current, f"taken over by {client} (owner idle {idle:.0f}s)")
+                elif force and watch_idle >= self.cfg.takeover_idle_s:
+                    self._release(self.current, f"taken over by {client} (owner not watching for {watch_idle:.0f}s"
+                                  f"{', paused' if self.current.paused else ''})")
                 else:
                     payload = {"reason": "active", **self.current.public(self.cfg.heartbeat_idle_s)}
-                    payload["takeover_available"] = idle >= self.cfg.takeover_idle_s
+                    payload["takeover_available"] = watch_idle >= self.cfg.takeover_idle_s
                     payload["takeover_idle_s"] = self.cfg.takeover_idle_s
                     raise Busy(payload)
             self.preparing = {"scene_id": scene_id, "since": now}
@@ -210,12 +223,14 @@ class SessionManager:
                 s.time = time_s
             if paused is not None:
                 s.paused = paused
+            if not s.paused:
+                s.last_watch = now
             return s
 
     def touch_segment(self, token: str) -> Session:
         with self.lock:
             s = self.get(token)
-            s.last_activity = time.monotonic()
+            s.last_activity = s.last_watch = time.monotonic()
             s.segments += 1
             return s
 

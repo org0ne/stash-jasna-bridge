@@ -58,10 +58,12 @@ optional `[[paths.map]]` rewrites.
   while the owner is alive. The token is the credential for heartbeat, end
   and HLS routes, so a stale tab cannot pull the new owner's segments.
 - **Takeover.** A 409 reports `takeover_available: true` once the current
-  owner has been idle at least `session.takeover_idle_s` (20s). A
-  `POST /session` with `force: true` then pre-empts that idle owner (a
-  fresh, active owner is never forced out). This is how a viewer reclaims
-  Jasna from a paused background tab without waiting out the full idle
+  owner has not been *watching* for `session.takeover_idle_s` (20s):
+  no segment fetch and no unpaused heartbeat in that time, so a paused tab
+  qualifies even though its heartbeats keep it from being idle-released. A
+  `POST /session` with `force: true` then pre-empts that owner (a
+  fresh, playing owner is never forced out). This is how a viewer reclaims
+  Jasna from a paused or background tab without waiting out the full idle
   timeout.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next

@@ -42,7 +42,7 @@ flags = []
 [session]
 heartbeat_idle_s = 90       # release the owner after this long without a heartbeat or segment fetch
 stream_linger_s = 120       # keep Jasna's stream open this long after release (warm ON/OFF/ON)
-takeover_idle_s = 20        # a forced request may pre-empt an owner idle at least this long
+takeover_idle_s = 20        # a forced request may pre-empt an owner that has not been watching (segment fetch or unpaused heartbeat) for this long; a paused tab counts as idle
 
 [auth]
 mode = "none"               # none | token | stash_cookie

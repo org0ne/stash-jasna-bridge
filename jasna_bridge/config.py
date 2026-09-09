@@ -52,7 +52,7 @@ class Config:
     heartbeat_idle_s: float = 90.0
     stream_linger_s: float = 120.0
     reaper_interval_s: float = 5.0
-    takeover_idle_s: float = 20.0   # a forced request may pre-empt an owner idle at least this long
+    takeover_idle_s: float = 20.0   # a forced request may pre-empt an owner not watching (paused or silent) this long
 
     # [auth]
     auth_mode: str = "none"  # none | token | stash_cookie

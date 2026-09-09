@@ -76,6 +76,14 @@ optional `[[paths.map]]` rewrites.
   without opening Jasna at all. A miss on such a session (eviction made a
   hole) opens Jasna on demand for that file. `/health` reports the cache
   under `cache`.
+- **Stall recovery.** Two failures are watched for. If Jasna stops
+  answering `/status` at all (a wedged HTTP server), the reaper restarts it
+  after two missed probes. If `/status` still answers but the render pass
+  goes quiet - no segment served to an active, *playing* session for
+  `session.pipeline_stall_s` (45s) though it keeps asking - that is a
+  pipeline stall (seen 2026-09-09 on a long file), and the reaper restarts
+  Jasna and re-opens on the same token too. A paused tab pulls no segments,
+  so it never counts as a stall.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next
   heartbeat gets 410 and the plugin drops back to the Stash source.

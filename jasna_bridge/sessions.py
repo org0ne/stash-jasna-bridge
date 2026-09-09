@@ -49,6 +49,8 @@ class Session:
     # idle-released) but should count as idle for takeover.
     last_watch: float = field(default_factory=time.monotonic)
     last_heartbeat: float | None = None
+    last_seg_request: float = field(default_factory=time.monotonic)  # client asked for a segment
+    last_seg_served: float = field(default_factory=time.monotonic)   # a segment was actually delivered (cache or Jasna)
     time: float = 0.0
     paused: bool = False
     segments: int = 0
@@ -275,9 +277,19 @@ class SessionManager:
     def touch_segment(self, token: str) -> Session:
         with self.lock:
             s = self.get(token)
-            s.last_activity = s.last_watch = time.monotonic()
+            now = time.monotonic()
+            s.last_activity = s.last_watch = s.last_seg_request = now
             s.segments += 1
             return s
+
+    def segment_served(self, token: str) -> None:
+        """A segment was actually delivered to the client, from cache or from
+        Jasna. Keeps the pipeline-stall clock alive: a slow-but-live pass still
+        serves one every few seconds, only a real stall goes quiet."""
+        with self.lock:
+            s = self.current
+            if s is not None and secrets.compare_digest(s.token, token):
+                s.last_seg_served = time.monotonic()
 
     def end(self, token: str) -> None:
         with self.lock:
@@ -326,9 +338,27 @@ class SessionManager:
                 self.procs.stop()
                 self.process_idle_since = None
             idle_check = (self.procs.managed and self.preparing is None and self.procs.alive())
+            # Pipeline stall: Jasna's HTTP server still answers /status (so the
+            # liveness probe below is happy) but the render pass has stopped
+            # producing segments. Seen 2026-09-09: after grinding a long file the
+            # pass went quiet at one segment, GPU 0%, /status still {streaming:
+            # true}, and the viewer sat forever. Distinct from a server wedge.
+            # Fire only for an active, playing (not paused), Jasna-served (not
+            # lazy/cache-only) session that has asked for a segment it has not
+            # been given for pipeline_stall_s.
+            stall = bool(s and not s.paused and not s.lazy and self.procs.managed
+                         and self.stream_path is not None and s is self.current
+                         and s.last_seg_request > s.last_seg_served
+                         and now - s.last_seg_served >= self.cfg.pipeline_stall_s
+                         and now - s.last_seg_request <= self.cfg.pipeline_stall_s)
         # Liveness probe outside the lock (network). Runs whether or not a session is
         # active: seen 2026-09-08, a seek wedged Jasna mid-session (ffmpeg child hung,
         # server stopped accepting) and the viewer sat stalled until they toggled.
+        if stall:
+            log.warning("Jasna answering /status but no segment served for %.0fs while playing; "
+                        "treating as a pipeline stall", self.cfg.pipeline_stall_s)
+            self._unresponsive = 0
+            return self._recover_wedged()
         if idle_check:
             if self.procs.responsive(timeout=3.0):
                 self._unresponsive = 0
@@ -364,7 +394,10 @@ class SessionManager:
                 raise JasnaError("stream did not become ready after restart")
             with self.lock:
                 if self.current is s:
-                    s.last_activity = time.monotonic()  # do not idle-release while we were busy fixing it
+                    now = time.monotonic()
+                    # do not idle-release, and give the fresh pass a full stall
+                    # window before the detector can fire again.
+                    s.last_activity = s.last_seg_served = s.last_seg_request = now
             log.info("Jasna restarted and %s re-opened; session %s continues", path, s.token[:8])
         except JasnaError as err:
             log.error("recovery failed (%s); releasing session %s", err, s.token[:8])

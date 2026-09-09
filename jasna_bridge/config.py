@@ -53,6 +53,7 @@ class Config:
     stream_linger_s: float = 120.0
     reaper_interval_s: float = 5.0
     takeover_idle_s: float = 20.0   # a forced request may pre-empt an owner not watching (paused or silent) this long
+    pipeline_stall_s: float = 45.0  # active+playing session, Jasna answering /status but no segment served this long -> restart
 
     # [auth]
     auth_mode: str = "none"  # none | token | stash_cookie
@@ -120,6 +121,7 @@ def from_dict(data: dict) -> Config:
     cfg.stream_linger_s = _get(session, "stream_linger_s", cfg.stream_linger_s)
     cfg.reaper_interval_s = _get(session, "reaper_interval_s", cfg.reaper_interval_s)
     cfg.takeover_idle_s = _get(session, "takeover_idle_s", cfg.takeover_idle_s)
+    cfg.pipeline_stall_s = _get(session, "pipeline_stall_s", cfg.pipeline_stall_s)
 
     auth = data.get("auth", {})
     cfg.auth_mode = _get(auth, "mode", cfg.auth_mode)

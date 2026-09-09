@@ -471,6 +471,63 @@ class Managed(unittest.TestCase):
         finally:
             h.close()
 
+    def test_pipeline_stall_is_recovered_while_status_ok(self):
+        # Jasna's /status keeps answering, but the render pass stops producing
+        # segments (the 2026-09-09 stall). The responsive-probe recovery never
+        # fires here; pipeline-stall detection must.
+        import tempfile
+        stall = os.path.join(tempfile.mkdtemp(), "stall")
+        h = BridgeHarness({"jasna": {"common_flags": ["--stall-file", stall], "process_idle_minutes": 60},
+                           "session": {"heartbeat_idle_s": 60, "stream_linger_s": 5,
+                                       "reaper_interval_s": 0.1, "pipeline_stall_s": 0.6}},
+                          managed=True)
+        try:
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+            self.assertEqual(st, 200, a)
+            pid1 = h.procs.pid()
+            st, _, _ = h.call("GET", f"/hls/{a['token']}/seg_00001.ts")
+            self.assertEqual(st, 200)
+            self.assertTrue(h.procs.responsive(), "status still answers")
+            with open(stall, "w") as fh:  # pass goes quiet; /status stays healthy
+                fh.write(str(pid1))
+            # keep asking for a segment we never get, as a playing hls.js would
+            deadline = time.time() + 20
+            while time.time() < deadline and (h.procs.pid() in (None, pid1) or not h.sessions.stream_path):
+                h.call("GET", f"/hls/{a['token']}/seg_00002.ts")  # 502 fast while stalled
+                time.sleep(0.1)
+            self.assertNotEqual(h.procs.pid(), pid1, "reaper should restart the stalled pass")
+            self.assertEqual(h.sessions.stream_path, "/media/a/one.mp4", "stream re-opened")
+            # the restarted process has a new pid, so it no longer stalls
+            st, _, hdr = h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+            self.assertEqual(st, 200)
+            st, snap, _ = h.call("GET", "/session")
+            self.assertTrue(snap["active"]); self.assertEqual(snap["stats"]["opens"], 2)
+        finally:
+            h.close()
+
+    def test_no_stall_recovery_when_paused(self):
+        # A paused tab stops pulling segments; that is not a stall.
+        import tempfile
+        stall = os.path.join(tempfile.mkdtemp(), "stall")
+        h = BridgeHarness({"jasna": {"common_flags": ["--stall-file", stall], "process_idle_minutes": 60},
+                           "session": {"heartbeat_idle_s": 60, "stream_linger_s": 5,
+                                       "reaper_interval_s": 0.1, "pipeline_stall_s": 0.4}},
+                          managed=True)
+        try:
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+            pid1 = h.procs.pid()
+            h.call("GET", f"/hls/{a['token']}/seg_00001.ts")
+            with open(stall, "w") as fh:
+                fh.write(str(pid1))
+            # request once, then pause and stop pulling
+            h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+            h.call("POST", f"/session/{a['token']}/heartbeat", {"time": 4, "paused": True})
+            time.sleep(1.2)  # well past pipeline_stall_s
+            self.assertEqual(h.procs.pid(), pid1, "paused session must not trigger a restart")
+            self.assertEqual(h.sessions.stats["opens"], 1)
+        finally:
+            h.close()
+
     def test_spawn_preset_switch_idle_stop(self):
         h = BridgeHarness({"jasna": {"process_idle_minutes": 1 / 60}}, managed=True)
         try:

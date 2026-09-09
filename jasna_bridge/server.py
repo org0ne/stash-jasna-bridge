@@ -295,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     body = None
                 if body:
+                    b.sessions.segment_served(token)
                     return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "hit"})
             if s.lazy:
                 try:
@@ -310,6 +311,7 @@ class Handler(BaseHTTPRequestHandler):
             if upstream.status != 200:
                 upstream.read()
                 return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
+            b.sessions.segment_served(token)  # Jasna produced it: pipeline is alive
             if key:
                 # Whole segment in memory (a few MB) so the cache write is atomic
                 # and the client never sees a partial file.

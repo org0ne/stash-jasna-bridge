@@ -153,10 +153,12 @@ class ProcessManager:
                     # HTTP server stopped accepting, and every request hung. Treat an
                     # unanswered /status as dead and restart rather than block callers.
                     log.warning("Jasna pid %s is alive but not answering /status; restarting", self.proc.pid)
-                    self.stop()
+                    self.stop(graceful=False)  # wedged: no point waiting on the broken teardown
                 else:
                     log.info("preset change %s -> %s: restarting Jasna", self.running_preset, preset)
-                    self.stop()
+                    # A preset change kills a running pass; its graceful teardown blocks
+                    # ~30s (the 2026-09-09 finding), so kill outright for a snappy switch.
+                    self.stop(graceful=False)
             elif self.proc is not None:
                 log.warning("Jasna exited with code %s; restarting", self.proc.returncode)
                 self.proc = None

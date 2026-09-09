@@ -1,0 +1,47 @@
+# stash-jasna-bridge configuration. Copy to bridge.toml (chmod 600 if it holds
+# license keys or tokens) and run: python3 -m jasna_bridge -c bridge.toml
+
+[server]
+host = "127.0.0.1"          # 0.0.0.0 / LAN IP when the reverse proxy is on another host
+port = 8770
+path_prefix = "/jasna"      # stripped when present; matches the reverse-proxy location
+cors_origins = []           # e.g. ["http://192.168.11.109:7777"] for a plain-HTTP Stash
+
+[stash]
+url = "http://127.0.0.1:9999"
+api_key = ""                # only needed if Stash has authentication enabled
+
+# Optional path rewrites when Jasna sees the media under a different root.
+# [[paths.map]]
+# stash = "/data"
+# jasna = "/storage/pool"
+
+[jasna]
+url = "http://127.0.0.1:8765"
+manage_process = false      # true: the bridge starts/stops jasna itself
+binary = ""                 # required when manage_process = true
+stream_port = 8765
+common_flags = []           # e.g. ["--license-email", "...", "--license-key", "..."]
+start_timeout_s = 180
+open_timeout_s = 60
+process_idle_minutes = 15   # managed only: stop the process after this long with no stream
+prewarm_path = ""           # managed only: clip to open once after start (TensorRT cache warm-up)
+default_preset = "default"
+
+[presets.default]
+description = "Jasna defaults"
+flags = []
+
+# [presets.hq]
+# description = "rfdetr-v6-large + unet-4x"
+# flags = ["--detection-model", "rfdetr-v6-large", "--detection-score-threshold", "0.4",
+#          "--secondary-restoration", "unet-4x", "--max-clip-size", "180", "--batch-size", "4"]
+
+[session]
+heartbeat_idle_s = 90       # release the owner after this long without a heartbeat or segment fetch
+stream_linger_s = 120       # keep Jasna's stream open this long after release (warm ON/OFF/ON)
+
+[auth]
+mode = "none"               # none | token | stash_cookie
+token = ""                  # for mode = token; the plugin sends it as Authorization: Bearer
+cache_s = 300               # stash_cookie: how long a validated cookie stays trusted

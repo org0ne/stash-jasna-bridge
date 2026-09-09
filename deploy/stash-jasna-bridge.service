@@ -1,0 +1,20 @@
+# systemd unit: copy to /etc/systemd/system/, adjust paths/user, then
+#   systemctl daemon-reload && systemctl enable --now stash-jasna-bridge
+[Unit]
+Description=Bridge between Stash jasna-switch and jasna --stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scott
+WorkingDirectory=/home/scott/Projects/stash-jasna-bridge
+ExecStart=/usr/bin/python3 -m jasna_bridge -c /home/scott/Projects/stash-jasna-bridge/bridge.toml
+Restart=on-failure
+RestartSec=5
+# Jasna needs the GPU; with manage_process = true it is a child of this unit.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

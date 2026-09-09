@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -13,6 +15,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from jasna_bridge import config  # noqa: E402
+from jasna_bridge.cache import SegmentCache  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
 from jasna_bridge.server import serve  # noqa: E402
 from jasna_bridge.sessions import SessionManager  # noqa: E402
@@ -46,13 +49,16 @@ class BridgeHarness:
                       "manage_process": managed, "binary": FAKE_JASNA_BIN if managed else ""},
             "presets": {"a": {"flags": ["--x", "1"]}, "b": {"flags": ["--x", "2"]}},
             "session": {"heartbeat_idle_s": 0.6, "stream_linger_s": 0.6, "reaper_interval_s": 0.1},
+            "cache": {"enabled": True, "dir": tempfile.mkdtemp(prefix="bridge-cache-"), "max_gb": 1.0},
         }
         for section, values in (overrides or {}).items():
             data.setdefault(section, {}).update(values)
         self.cfg = config.from_dict(data)
+        self.cache_dir = self.cfg.cache_dir
         client = JasnaClient(self.cfg.jasna_url, timeout=3)
         self.procs = ProcessManager(self.cfg, client)
-        self.sessions = SessionManager(self.cfg, client, self.procs)
+        self.cache = SegmentCache(self.cfg) if self.cfg.cache_enabled else None
+        self.sessions = SessionManager(self.cfg, client, self.procs, self.cache)
         self.sessions.start()
         self.server = serve(self.cfg, self.sessions, StashClient(self.cfg.stash_url))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -63,6 +69,7 @@ class BridgeHarness:
         self.stash_srv.shutdown(); self.stash_srv.server_close()
         if self.jasna_srv:
             self.jasna_srv.shutdown(); self.jasna_srv.server_close()
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
 
     def call(self, method, path, body=None, headers=None, prefix="/jasna"):
         data = json.dumps(body).encode() if body is not None else None
@@ -266,6 +273,134 @@ class Auth(unittest.TestCase):
             self.assertEqual(len(h.stash_seen), n)  # cached, no second GraphQL call
         finally:
             h.close()
+
+
+class Cache(unittest.TestCase):
+    """Phase C: segments are cached on disk; a complete stream replays with no Jasna."""
+
+    SEG_BYTES = len("seg_00000.ts:") + 188 * 8  # fake_jasna segment size
+
+    def setUp(self):
+        self.h = BridgeHarness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def fetch_all(self, h, token, n):
+        for i in range(n):
+            st, _, hdr = h.call("GET", f"/hls/{token}/seg_{i:05d}.ts")
+            self.assertEqual(st, 200, i)
+        return hdr
+
+    def test_segment_served_from_cache_on_second_request(self):
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        self.assertFalse(a["cached"])
+        st, body1, hdr1 = h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+        st, body2, hdr2 = h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+        self.assertEqual(body1, body2)
+        self.assertEqual((hdr1["X-Bridge-Cache"], hdr2["X-Bridge-Cache"]), ("miss", "hit"))
+        self.assertEqual(h.jasna.segments, ["seg_00002.ts"])  # Jasna asked once
+        snap = h.cache.snapshot()
+        self.assertEqual((snap["segments"], snap["hits"], snap["stored"]), (1, 1, 1))
+        key = h.sessions.current.cache_key
+        self.assertTrue(os.path.exists(h.cache.file_path(key, "seg_00002.ts")))
+
+    def test_complete_stream_replays_without_jasna(self):
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        st, pl, _ = h.call("GET", a["playlist_path"])
+        n = pl.count(b"seg_")
+        self.assertEqual(n, 11)  # fake_jasna: 40s / 4s + 1
+        self.fetch_all(h, a["token"], n)
+        key = h.sessions.current.cache_key
+        self.assertTrue(h.cache.is_complete(key))
+        h.call("DELETE", f"/session/{a['token']}")
+        time.sleep(1.0)  # linger expires, stream closed
+        self.assertEqual(h.jasna.stops, 1)
+        segs_before = list(h.jasna.segments)
+        # rewatch: no /open, playlist and every segment from disk
+        st, b, _ = h.call("POST", "/session", {"scene_id": "1"})
+        self.assertEqual(st, 200, b); self.assertTrue(b["cached"])
+        self.assertEqual(len(h.jasna.opens), 1)
+        st, pl2, hdr = h.call("GET", b["playlist_path"])
+        self.assertEqual((st, pl2), (200, pl))
+        hdr = self.fetch_all(h, b["token"], n)
+        self.assertEqual(hdr["X-Bridge-Cache"], "hit")
+        self.assertEqual(h.jasna.segments, segs_before)
+        st, snap, _ = h.call("GET", "/session")
+        self.assertTrue(snap["session"]["from_cache"]); self.assertEqual(snap["stats"]["cached_sessions"], 1)
+        self.assertIsNone(snap["stream"]["path"])  # Jasna never opened for this session
+
+    def test_cache_hole_opens_jasna_lazily(self):
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        h.call("GET", a["playlist_path"])
+        self.fetch_all(h, a["token"], 11)
+        key = h.sessions.current.cache_key
+        h.call("DELETE", f"/session/{a['token']}")
+        time.sleep(1.0)
+        os.unlink(h.cache.file_path(key, "seg_00005.ts"))  # a hole the index does not know about
+        _, b, _ = h.call("POST", "/session", {"scene_id": "1"})
+        self.assertTrue(b["cached"]); self.assertEqual(len(h.jasna.opens), 1)
+        st, _, hdr = h.call("GET", f"/hls/{b['token']}/seg_00004.ts")
+        self.assertEqual(hdr["X-Bridge-Cache"], "hit")
+        st, body, hdr = h.call("GET", f"/hls/{b['token']}/seg_00005.ts")
+        self.assertEqual(st, 200); self.assertEqual(hdr["X-Bridge-Cache"], "miss")
+        self.assertTrue(body.startswith(b"seg_00005.ts:"))
+        self.assertEqual(len(h.jasna.opens), 2)  # opened on demand, for the same file
+        self.assertEqual(h.jasna.opens[-1], "/media/a/one.mp4")
+        st, snap, _ = h.call("GET", "/session")
+        self.assertFalse(snap["session"]["from_cache"]); self.assertEqual(snap["stream"]["path"], "/media/a/one.mp4")
+        self.assertTrue(h.cache.is_complete(key))  # hole filled
+
+    def test_lru_eviction_by_size(self):
+        self.h.close()
+        self.h = BridgeHarness({"cache": {"max_gb": (2 * self.SEG_BYTES + 10) / 1e9}})
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        h.call("GET", a["playlist_path"])
+        key = h.sessions.current.cache_key
+        for i in (0, 1):
+            h.call("GET", f"/hls/{a['token']}/seg_{i:05d}.ts")
+        h.call("GET", f"/hls/{a['token']}/seg_00000.ts")  # seg 0 is now the most recently used
+        h.call("GET", f"/hls/{a['token']}/seg_00002.ts")  # third does not fit: evict LRU = seg 1
+        snap = h.cache.snapshot()
+        self.assertEqual((snap["segments"], snap["evictions"]), (2, 1))
+        self.assertFalse(os.path.exists(h.cache.file_path(key, "seg_00001.ts")))
+        self.assertTrue(os.path.exists(h.cache.file_path(key, "seg_00000.ts")))
+        self.assertFalse(h.cache.is_complete(key))
+
+    def test_key_depends_on_preset_flags_and_version(self):
+        c = self.h.cache
+        k1 = c.key("/m/a.mp4", "a", ["--x", "1"])
+        self.assertEqual(k1, c.key("/m/a.mp4", "a", ["--x", "1"]))
+        self.assertNotEqual(k1, c.key("/m/a.mp4", "a", ["--x", "2"]))
+        self.assertNotEqual(k1, c.key("/m/b.mp4", "a", ["--x", "1"]))
+        c.version = "0.11.0"
+        self.assertNotEqual(k1, c.key("/m/a.mp4", "a", ["--x", "1"]))
+
+    def test_cache_survives_restart_of_bridge(self):
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        h.call("GET", a["playlist_path"])
+        self.fetch_all(h, a["token"], 11)
+        key = h.sessions.current.cache_key
+        fresh = SegmentCache(h.cfg)  # rescans the same directory
+        self.assertTrue(fresh.is_complete(key))
+        self.assertEqual(fresh.snapshot()["segments"], 11)
+        self.assertIsNotNone(fresh.manifest(key))
+
+    def test_cache_disabled(self):
+        self.h.close()
+        self.h = BridgeHarness({"cache": {"enabled": False}})
+        h = self.h
+        self.assertIsNone(h.cache)
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        st, _, hdr = h.call("GET", f"/hls/{a['token']}/seg_00001.ts")
+        self.assertEqual(st, 200); self.assertNotIn("X-Bridge-Cache", hdr)
+        h.call("GET", f"/hls/{a['token']}/seg_00001.ts")
+        self.assertEqual(h.jasna.segments, ["seg_00001.ts", "seg_00001.ts"])
 
 
 class Managed(unittest.TestCase):

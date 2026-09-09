@@ -49,8 +49,11 @@ mode = "none"               # none | token | stash_cookie
 token = ""                  # for mode = token; the plugin sends it as Authorization: Bearer
 cache_s = 300               # stash_cookie: how long a validated cookie stays trusted
 
-[cache]                     # Phase C (segment cache) - not yet wired up; fields reserved
+[cache]                     # on-disk segment cache (Phase C)
 enabled = true
 dir = ""                    # default: ~/.cache/stash-jasna-bridge/segments
-max_gb = 5
-version = ""                # cache-key salt; default parsed from jasna.binary path
+max_gb = 5                  # LRU by total size
+version = ""                # part of the cache key; default parsed from the jasna.binary path
+                            # (e.g. ".../jasna-linux-nvidia-0.10.0/jasna" -> "0.10.0"), else "v0".
+                            # Set it by hand when manage_process = false, and bump it after a
+                            # Jasna upgrade so old restorations are not replayed.

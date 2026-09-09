@@ -39,6 +39,7 @@ class Bridge:
     def __init__(self, cfg, sessions, stash: StashClient):
         self.cfg = cfg
         self.sessions = sessions
+        self.cache = getattr(sessions, "cache", None)
         self.stash = stash
         self.cookies = CookieValidator(stash, cfg.auth_cache_s) if cfg.auth_mode == "stash_cookie" else None
         self.started = time.time()
@@ -189,6 +190,7 @@ class Handler(BaseHTTPRequestHandler):
                 "preset": procs.running_preset if procs.managed else None,
                 "warm": b.sessions.is_warm(),
             },
+            "cache": b.cache.snapshot() if b.cache else {"enabled": False},
             **b.sessions.snapshot(),
         })
 
@@ -261,15 +263,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.OK, {"ok": True})
 
     def h_playlist(self, token: str):
-        self.bridge.sessions.get(token)
-        data = self.bridge.sessions.jasna.playlist()
+        b = self.bridge
+        s = b.sessions.get(token)
+        if b.cache and s.cache_key:
+            data = b.cache.manifest(s.cache_key)
+            if data is not None:
+                return self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
+        data = b.sessions.jasna.playlist()
+        if data is None and s.lazy:
+            try:
+                b.sessions.ensure_stream(token)
+            except JasnaError as err:
+                return self.error(HTTPStatus.BAD_GATEWAY, str(err))
+            data = b.sessions.jasna.playlist()
         if data is None:
             return self.error(HTTPStatus.BAD_GATEWAY, "Jasna has no stream open")
+        if b.cache and s.cache_key:
+            b.cache.store_manifest(s.cache_key, s.path, s.preset, b.cfg.presets[s.preset].flags, data)
         self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
 
     def h_segment(self, token: str, seg: str):
-        self.bridge.sessions.touch_segment(token)
-        jasna = self.bridge.sessions.jasna
+        b = self.bridge
+        s = b.sessions.touch_segment(token)
+        key = s.cache_key if b.cache else ""
+        if key:
+            fn = b.cache.hit(key, seg)
+            if fn:
+                try:
+                    with open(fn, "rb") as fh:
+                        body = fh.read()
+                except OSError:
+                    body = None
+                if body:
+                    return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "hit"})
+            if s.lazy:
+                try:
+                    b.sessions.ensure_stream(token)
+                except JasnaError as err:
+                    return self.error(HTTPStatus.BAD_GATEWAY, str(err))
+        jasna = b.sessions.jasna
         try:
             upstream = jasna.open_segment(seg)
         except OSError as err:
@@ -278,6 +310,12 @@ class Handler(BaseHTTPRequestHandler):
             if upstream.status != 200:
                 upstream.read()
                 return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
+            if key:
+                # Whole segment in memory (a few MB) so the cache write is atomic
+                # and the client never sees a partial file.
+                body = upstream.read()
+                b.cache.put(key, seg, body)
+                return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "miss"})
             length = upstream.getheader("Content-Length")
             if length is None:
                 body = upstream.read()

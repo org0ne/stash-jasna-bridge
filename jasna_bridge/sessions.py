@@ -52,6 +52,8 @@ class Session:
     time: float = 0.0
     paused: bool = False
     segments: int = 0
+    cache_key: str = ""   # segment-cache key for (path, preset flags, jasna version); "" = cache off
+    lazy: bool = False    # served from a complete cache; Jasna is opened only on a miss
 
     def idle_seconds(self, now: float | None = None) -> float:
         return (now or time.monotonic()) - self.last_activity
@@ -72,22 +74,25 @@ class Session:
             "time": self.time,
             "paused": self.paused,
             "segments": self.segments,
+            "from_cache": self.lazy,
         }
 
 
 class SessionManager:
-    def __init__(self, cfg, jasna: JasnaClient, procs: ProcessManager):
+    def __init__(self, cfg, jasna: JasnaClient, procs: ProcessManager, cache=None):
         self.cfg = cfg
         self.jasna = jasna
         self.procs = procs
+        self.cache = cache  # SegmentCache or None
         self.lock = threading.RLock()
+        self._open_lock = threading.Lock()  # serialises lazy opens (network I/O, never under self.lock)
         self.current: Session | None = None
         self.preparing: dict | None = None  # {scene_id, since} while /open is in flight
         self.stream_path: str | None = None
         self.stream_preset: str | None = None
         self.stream_idle_since: float | None = None
         self.process_idle_since: float | None = time.monotonic()
-        self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0}
+        self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0}
         self._stop = threading.Event()
         self._reaper = threading.Thread(target=self._reap_loop, name="reaper", daemon=True)
 
@@ -172,7 +177,20 @@ class SessionManager:
                     payload["takeover_idle_s"] = self.cfg.takeover_idle_s
                     raise Busy(payload)
             self.preparing = {"scene_id": scene_id, "since": now}
+        key = self.cache.key(path, preset, self.cfg.presets[preset].flags) if self.cache else ""
         try:
+            if key and self.cache.is_complete(key):
+                # Every segment is on disk: no Jasna, no GPU. A miss (eviction
+                # made a hole) opens Jasna on demand via ensure_stream().
+                with self.lock:
+                    session = Session(secrets.token_urlsafe(24), scene_id, path, preset, client, time=time_s,
+                                      cache_key=key, lazy=True)
+                    self.current = session
+                    self.stats["sessions"] += 1
+                    self.stats["cached_sessions"] += 1
+                log.info("session %s: scene %s preset %s for %s (from cache, Jasna not opened)",
+                         session.token[:8], scene_id, preset, client)
+                return session, {"reused": False, "cold": False, "switched": False, "cached": True}
             cold = self.procs.ensure(preset)
             reused = False
             with self.lock:
@@ -196,13 +214,14 @@ class SessionManager:
             else:
                 self.stats["reuses"] += 1
             with self.lock:
-                session = Session(secrets.token_urlsafe(24), scene_id, path, preset, client, time=time_s)
+                session = Session(secrets.token_urlsafe(24), scene_id, path, preset, client, time=time_s,
+                                  cache_key=key)
                 self.current = session
                 self.stream_idle_since = None
                 self.stats["sessions"] += 1
             log.info("session %s: scene %s preset %s for %s (%s)", session.token[:8], scene_id, preset, client,
                      "reused" if reused else "cold" if cold else "switched" if switched else "warm")
-            return session, {"reused": reused, "cold": cold, "switched": switched}
+            return session, {"reused": reused, "cold": cold, "switched": switched, "cached": False}
         except Exception:
             with self.lock:
                 if self.stream_path == path and self.jasna.playlist() is None:
@@ -225,6 +244,32 @@ class SessionManager:
                 s.paused = paused
             if not s.paused:
                 s.last_watch = now
+            return s
+
+    def ensure_stream(self, token: str) -> Session:
+        """Lazy open: a session served from cache hit a segment the cache does
+        not have (or lost to eviction). Open Jasna for its file now."""
+        with self.lock:
+            s = self.get(token)
+        with self._open_lock:
+            with self.lock:
+                s = self.get(token)
+                have = self.stream_path == s.path and self.stream_preset == s.preset
+            if have and not self.procs.managed:
+                return s
+            if have and self.procs.alive() and (self.jasna.status() or {}).get("path") == s.path:
+                return s
+            log.info("session %s: cache miss, opening Jasna for %s", s.token[:8], s.path)
+            self.procs.ensure(s.preset)
+            self.jasna.open(s.path)
+            self.stats["opens"] += 1
+            with self.lock:
+                self.stream_path, self.stream_preset, self.stream_idle_since = s.path, s.preset, None
+                self.process_idle_since = None
+            if not self.jasna.wait_ready(self.cfg.jasna_open_timeout_s, cancelled=self._stop.is_set):
+                raise JasnaError("stream did not become ready in time")
+            with self.lock:
+                s.lazy = False
             return s
 
     def touch_segment(self, token: str) -> Session:
@@ -298,7 +343,7 @@ class SessionManager:
         file so the viewer's hls.js retries resume on the same token. Called from
         the reaper thread, network I/O outside the lock."""
         with self.lock:
-            s = self.current
+            s = self.current if (self.current and not self.current.lazy) else None
             path, preset = (s.path, s.preset) if s else (self.stream_path, self.stream_preset)
         log.warning("Jasna not answering /status; restarting it%s",
                     f" and re-opening {path} for session {s.token[:8]}" if s else "")

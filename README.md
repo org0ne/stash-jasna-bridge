@@ -65,6 +65,17 @@ optional `[[paths.map]]` rewrites.
   fresh, playing owner is never forced out). This is how a viewer reclaims
   Jasna from a paused or background tab without waiting out the full idle
   timeout.
+- **Segment cache** (`[cache]`, on by default). Every segment the bridge
+  proxies is written to `cache.dir` under a key of (file path, preset flags,
+  Jasna version), LRU-evicted at `cache.max_gb`. A repeat request for a
+  segment is served from disk (`X-Bridge-Cache: hit`), so backward seeks and
+  OFF/ON near the same spot never touch the GPU. Jasna's manifest is kept
+  per stream; once every segment it lists is on disk the stream is
+  *complete* and the next session for it is served entirely from cache
+  (`cached: true` in the `/session` reply, `from_cache` in the snapshot)
+  without opening Jasna at all. A miss on such a session (eviction made a
+  hole) opens Jasna on demand for that file. `/health` reports the cache
+  under `cache`.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next
   heartbeat gets 410 and the plugin drops back to the Stash source.

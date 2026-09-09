@@ -8,6 +8,7 @@ import sys
 import threading
 
 from . import VERSION, config
+from .cache import SegmentCache
 from .jasna import JasnaClient, ProcessManager
 from .server import serve
 from .sessions import SessionManager
@@ -30,7 +31,8 @@ def main(argv=None) -> int:
 
     jasna = JasnaClient(cfg.jasna_url)
     procs = ProcessManager(cfg, jasna)
-    sessions = SessionManager(cfg, jasna, procs)
+    cache = SegmentCache(cfg) if cfg.cache_enabled else None
+    sessions = SessionManager(cfg, jasna, procs, cache)
     stash = StashClient(cfg.stash_url, cfg.stash_api_key)
     sessions.start()
     server = serve(cfg, sessions, stash)

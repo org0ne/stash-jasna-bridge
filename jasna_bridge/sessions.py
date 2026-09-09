@@ -265,21 +265,49 @@ class SessionManager:
                 log.info("Jasna idle for %.0f min, stopping process", self.cfg.process_idle_minutes)
                 self.procs.stop()
                 self.process_idle_since = None
-            idle_check = (self.procs.managed and self.current is None and self.preparing is None
-                          and self.procs.alive())
-        # Liveness probe outside the lock (network). A wedged Jasna otherwise sits
-        # holding VRAM until process_idle_minutes and hangs the next session.
+            idle_check = (self.procs.managed and self.preparing is None and self.procs.alive())
+        # Liveness probe outside the lock (network). Runs whether or not a session is
+        # active: seen 2026-09-08, a seek wedged Jasna mid-session (ffmpeg child hung,
+        # server stopped accepting) and the viewer sat stalled until they toggled.
         if idle_check:
             if self.procs.responsive(timeout=3.0):
                 self._unresponsive = 0
             else:
                 self._unresponsive = getattr(self, "_unresponsive", 0) + 1
                 if self._unresponsive >= 2:
-                    log.warning("Jasna not answering /status (%d checks); stopping it so the next session restarts it",
-                                self._unresponsive)
-                    self.procs.stop()
-                    with self.lock:
-                        self.stream_path = self.stream_preset = None
-                        self.stream_idle_since = None
-                        self.process_idle_since = None
                     self._unresponsive = 0
+                    self._recover_wedged()
+
+    def _recover_wedged(self) -> None:
+        """Jasna stopped answering. Restart it; if a session is active, re-open its
+        file so the viewer's hls.js retries resume on the same token. Called from
+        the reaper thread, network I/O outside the lock."""
+        with self.lock:
+            s = self.current
+            path, preset = (s.path, s.preset) if s else (self.stream_path, self.stream_preset)
+        log.warning("Jasna not answering /status; restarting it%s",
+                    f" and re-opening {path} for session {s.token[:8]}" if s else "")
+        self.procs.stop()
+        with self.lock:
+            self.stream_path = self.stream_preset = None
+            self.stream_idle_since = None
+            self.process_idle_since = None if s else time.monotonic()
+        if not s:
+            return
+        try:
+            self.procs.ensure(preset)
+            self.jasna.open(path)
+            self.stats["opens"] += 1
+            with self.lock:
+                self.stream_path, self.stream_preset = path, preset
+            if not self.jasna.wait_ready(self.cfg.jasna_open_timeout_s, cancelled=self._stop.is_set):
+                raise JasnaError("stream did not become ready after restart")
+            with self.lock:
+                if self.current is s:
+                    s.last_activity = time.monotonic()  # do not idle-release while we were busy fixing it
+            log.info("Jasna restarted and %s re-opened; session %s continues", path, s.token[:8])
+        except JasnaError as err:
+            log.error("recovery failed (%s); releasing session %s", err, s.token[:8])
+            with self.lock:
+                if self.current is s:
+                    self._release(s, "jasna recovery failed")

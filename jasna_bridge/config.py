@@ -36,6 +36,7 @@ class Config:
     manage_process: bool = False
     jasna_binary: str = ""
     jasna_workdir: str = ""  # cwd for the spawned process; default: the binary's directory
+    jasna_log_file: str = ""  # append Jasna's stdout/stderr here (managed only); empty = inherit
     jasna_stream_port: int = 8765
     jasna_common_flags: list[str] = field(default_factory=list)
     jasna_start_timeout_s: float = 180.0
@@ -96,6 +97,7 @@ def from_dict(data: dict) -> Config:
     cfg.manage_process = _get(jasna, "manage_process", cfg.manage_process)
     cfg.jasna_binary = _get(jasna, "binary", cfg.jasna_binary)
     cfg.jasna_workdir = _get(jasna, "workdir", cfg.jasna_workdir)
+    cfg.jasna_log_file = _get(jasna, "log_file", cfg.jasna_log_file)
     cfg.jasna_stream_port = _get(jasna, "stream_port", cfg.jasna_stream_port)
     cfg.jasna_common_flags = list(_get(jasna, "common_flags", []))
     cfg.jasna_start_timeout_s = _get(jasna, "start_timeout_s", cfg.jasna_start_timeout_s)

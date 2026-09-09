@@ -167,10 +167,23 @@ class ProcessManager:
         cmd = self.command(preset)
         log.info("starting Jasna: %s", " ".join(cmd[:6]) + (" ..." if len(cmd) > 6 else ""))
         cwd = self.cfg.jasna_workdir or os.path.dirname(os.path.abspath(self.cfg.jasna_binary)) or None
+        out = None
+        if self.cfg.jasna_log_file:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(self.cfg.jasna_log_file)), exist_ok=True)
+                out = open(self.cfg.jasna_log_file, "ab", buffering=0)
+                out.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} start preset={preset} =====\n".encode())
+            except OSError as err:
+                log.warning("cannot open jasna log_file %s: %s", self.cfg.jasna_log_file, err)
+                out = None
         try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True, cwd=cwd)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True, cwd=cwd,
+                                         stdout=out, stderr=subprocess.STDOUT if out else None)
         except OSError as err:
             raise JasnaError(f"could not start Jasna: {err}") from err
+        finally:
+            if out is not None:
+                out.close()  # the child holds its own descriptor
         self.running_preset = preset
         self.started_at = time.monotonic()
         deadline = self.started_at + self.cfg.jasna_start_timeout_s

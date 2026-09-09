@@ -278,6 +278,35 @@ class Managed(unittest.TestCase):
         finally:
             h.close()
 
+    def test_wedged_jasna_mid_session_is_reopened(self):
+        import tempfile
+        hang = os.path.join(tempfile.mkdtemp(), "hang")
+        h = BridgeHarness({"jasna": {"common_flags": ["--hang-file", hang], "process_idle_minutes": 60},
+                           "session": {"heartbeat_idle_s": 60, "stream_linger_s": 5, "reaper_interval_s": 0.2}},
+                          managed=True)
+        try:
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+            self.assertEqual(st, 200, a)
+            pid1 = h.procs.pid()
+            st, _, _ = h.call("GET", f"/hls/{a['token']}/seg_00001.ts")
+            self.assertEqual(st, 200)
+            with open(hang, "w") as fh:  # wedge Jasna while the viewer is watching
+                fh.write(str(pid1))
+            deadline = time.time() + 25
+            while time.time() < deadline and (h.procs.pid() in (None, pid1) or not h.sessions.stream_path):
+                time.sleep(0.3)
+            self.assertNotEqual(h.procs.pid(), pid1, "reaper should restart the wedged process")
+            self.assertEqual(h.sessions.stream_path, "/media/a/one.mp4", "stream re-opened")
+            # same token keeps working: heartbeat and segments
+            st, hb, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {"time": 9, "paused": False})
+            self.assertEqual(st, 200, hb)
+            st, _, _ = h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+            self.assertEqual(st, 200)
+            st, snap, _ = h.call("GET", "/session")
+            self.assertTrue(snap["active"]); self.assertEqual(snap["stats"]["opens"], 2)
+        finally:
+            h.close()
+
     def test_spawn_preset_switch_idle_stop(self):
         h = BridgeHarness({"jasna": {"process_idle_minutes": 1 / 60}}, managed=True)
         try:

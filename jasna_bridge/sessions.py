@@ -377,7 +377,7 @@ class SessionManager:
             path, preset = (s.path, s.preset) if s else (self.stream_path, self.stream_preset)
         log.warning("Jasna not answering /status; restarting it%s",
                     f" and re-opening {path} for session {s.token[:8]}" if s else "")
-        self.procs.stop()
+        self.procs.stop(graceful=False)  # its graceful teardown is the broken path; kill outright
         with self.lock:
             self.stream_path = self.stream_preset = None
             self.stream_idle_since = None

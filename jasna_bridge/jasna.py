@@ -219,26 +219,43 @@ class ProcessManager:
         """True if Jasna answers /status within `timeout`."""
         return self.client.status(timeout=timeout) is not None
 
-    def stop(self) -> None:
+    def stop(self, graceful: bool = True) -> None:
+        """Stop the process group. graceful=True gives Jasna a SIGTERM and 20s
+        to exit on its own (used for idle/preset-change stops). graceful=False
+        goes straight to SIGKILL: on the recovery paths Jasna is wedged or its
+        render pass is stalled, and its graceful shutdown is exactly the broken
+        thing (a cancelled pass blocks its pipeline threads ~30s each; seen
+        2026-09-09), so waiting on SIGTERM just adds that delay to recovery."""
         with self._lock:
             proc = self.proc
             if proc is None:
                 return
             if proc.poll() is None:
-                log.info("stopping Jasna pid %s", proc.pid)
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    log.warning("Jasna ignored SIGTERM, killing")
+                if graceful:
+                    log.info("stopping Jasna pid %s", proc.pid)
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        log.warning("Jasna ignored SIGTERM, killing")
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait(timeout=5)
+                else:
+                    log.info("killing Jasna pid %s (fast recovery, no graceful wait)", proc.pid)
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    proc.wait(timeout=5)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
             # Jasna's ffmpeg children share the session/group and have been seen
             # to survive SIGTERM (systemd had to SIGKILL "vf#0:0" on unit stop).
             # The main process is gone by now; sweep the rest of the group.

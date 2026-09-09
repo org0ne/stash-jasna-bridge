@@ -175,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
     # ----- handlers -----
     def h_health(self):
         b = self.bridge
-        status = b.sessions.jasna.status()
+        status = b.sessions.jasna.status(timeout=3.0)
         procs = b.sessions.procs
         self.send_json(HTTPStatus.OK, {
             "version": VERSION,

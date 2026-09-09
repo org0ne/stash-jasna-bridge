@@ -42,10 +42,11 @@ class JasnaClient:
         req = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
         return urllib.request.urlopen(req, timeout=timeout or self.timeout)
 
-    def status(self) -> dict | None:
-        """Jasna's /status, or None when the server is unreachable."""
+    def status(self, timeout: float | None = None) -> dict | None:
+        """Jasna's /status, or None when the server is unreachable or does not
+        answer within `timeout` (a wedged Jasna accepts nothing at all)."""
         try:
-            with self._request("GET", "/status") as resp:
+            with self._request("GET", "/status", timeout=timeout or 5.0) as resp:
                 return json.loads(resp.read().decode())
         except (urllib.error.URLError, OSError, ValueError):
             return None
@@ -72,7 +73,7 @@ class JasnaClient:
     def playlist(self) -> bytes | None:
         """The manifest bytes, or None if Jasna has no stream open."""
         try:
-            with self._request("GET", "/stream.m3u8") as resp:
+            with self._request("GET", "/stream.m3u8", timeout=5.0) as resp:
                 return resp.read()
         except urllib.error.HTTPError:
             return None
@@ -146,9 +147,16 @@ class ProcessManager:
         with self._lock:
             if self.proc is not None and self.proc.poll() is None:
                 if self.running_preset == preset:
-                    return False
-                log.info("preset change %s -> %s: restarting Jasna", self.running_preset, preset)
-                self.stop()
+                    if self.responsive():
+                        return False
+                    # Seen 2026-09-08: an ffmpeg child wedged, Jasna's single-threaded
+                    # HTTP server stopped accepting, and every request hung. Treat an
+                    # unanswered /status as dead and restart rather than block callers.
+                    log.warning("Jasna pid %s is alive but not answering /status; restarting", self.proc.pid)
+                    self.stop()
+                else:
+                    log.info("preset change %s -> %s: restarting Jasna", self.running_preset, preset)
+                    self.stop()
             elif self.proc is not None:
                 log.warning("Jasna exited with code %s; restarting", self.proc.returncode)
                 self.proc = None
@@ -194,6 +202,10 @@ class ProcessManager:
         except (JasnaError, OSError) as err:
             log.warning("prewarm failed: %s", err)
 
+    def responsive(self, timeout: float = 5.0) -> bool:
+        """True if Jasna answers /status within `timeout`."""
+        return self.client.status(timeout=timeout) is not None
+
     def stop(self) -> None:
         with self._lock:
             proc = self.proc
@@ -214,6 +226,13 @@ class ProcessManager:
                     except ProcessLookupError:
                         pass
                     proc.wait(timeout=5)
+            # Jasna's ffmpeg children share the session/group and have been seen
+            # to survive SIGTERM (systemd had to SIGKILL "vf#0:0" on unit stop).
+            # The main process is gone by now; sweep the rest of the group.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
             self.proc = None
             self.running_preset = None
             self.started_at = None

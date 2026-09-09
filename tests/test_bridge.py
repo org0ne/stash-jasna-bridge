@@ -240,6 +240,44 @@ class Auth(unittest.TestCase):
 
 
 class Managed(unittest.TestCase):
+    def test_wedged_jasna_is_restarted(self):
+        import tempfile
+        hang = os.path.join(tempfile.mkdtemp(), "hang")
+        h = BridgeHarness({"jasna": {"common_flags": ["--hang-file", hang], "process_idle_minutes": 60},
+                           "session": {"heartbeat_idle_s": 5, "stream_linger_s": 0.3, "reaper_interval_s": 0.2}},
+                          managed=True)
+        try:
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+            self.assertEqual(st, 200, a)
+            pid1 = h.procs.pid(); self.assertIsNotNone(pid1)
+            h.call("DELETE", f"/session/{a['token']}")
+            time.sleep(0.6)  # linger expires -> /stop -> process idle (still alive)
+            # wedge the running process: every request now blocks forever
+            with open(hang, "w") as fh:
+                fh.write(str(pid1))
+            # on-demand path: ensure() probes, sees no answer, restarts
+            t0 = time.time()
+            st, b, _ = h.call("POST", "/session", {"scene_id": "2"})
+            self.assertEqual(st, 200, b); self.assertTrue(b["cold"])
+            self.assertNotEqual(h.procs.pid(), pid1)
+            self.assertLess(time.time() - t0, 20, "recovery should not wait on the wedged process")
+            st, _, _ = h.call("GET", f"/hls/{b['token']}/seg_00000.ts")
+            self.assertEqual(st, 200)
+            h.call("DELETE", f"/session/{b['token']}")
+            time.sleep(0.6)
+            # idle path: wedge the new process while nobody is watching; the reaper stops it
+            pid2 = h.procs.pid()
+            with open(hang, "w") as fh:
+                fh.write(str(pid2))
+            deadline = time.time() + 15
+            while time.time() < deadline and h.procs.alive():
+                time.sleep(0.3)
+            self.assertFalse(h.procs.alive(), "reaper should stop a wedged idle Jasna")
+            st, h2, _ = h.call("GET", "/health")
+            self.assertFalse(h2["jasna"]["running"])
+        finally:
+            h.close()
+
     def test_spawn_preset_switch_idle_stop(self):
         h = BridgeHarness({"jasna": {"process_idle_minutes": 1 / 60}}, managed=True)
         try:

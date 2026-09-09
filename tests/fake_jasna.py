@@ -18,8 +18,11 @@ SEGMENT_SECONDS = 4.0
 
 
 class FakeJasna:
-    def __init__(self, open_delay: float = 0.0, duration: float = 40.0):
+    def __init__(self, open_delay: float = 0.0, duration: float = 40.0, hang_file: str | None = None):
         self.open_delay = open_delay
+        # If hang_file exists and contains this process's pid, every request
+        # blocks forever - simulates a wedged Jasna whose server stops answering.
+        self.hang_file = hang_file
         self.duration = duration
         self.path: str | None = None
         self.opens: list[str] = []
@@ -44,6 +47,16 @@ def make_handler(state: FakeJasna):
         def log_message(self, *a):
             pass
 
+        def _maybe_hang(self):
+            import os
+            hf = state.hang_file
+            if hf and os.path.exists(hf):
+                try:
+                    if open(hf).read().strip() == str(os.getpid()):
+                        time.sleep(3600)
+                except OSError:
+                    pass
+
         def reply(self, status, body: bytes, ctype="application/json"):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -53,6 +66,7 @@ def make_handler(state: FakeJasna):
             self.wfile.write(body)
 
         def do_GET(self):
+            self._maybe_hang()
             if self.path == "/status":
                 return self.reply(200, json.dumps({"streaming": state.path is not None, "path": state.path}).encode())
             if self.path.startswith("/stream.m3u8"):
@@ -69,6 +83,7 @@ def make_handler(state: FakeJasna):
             self.reply(404, b"not found", "text/plain")
 
         def do_POST(self):
+            self._maybe_hang()
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
             if self.path == "/open":
@@ -91,8 +106,8 @@ def make_handler(state: FakeJasna):
     return H
 
 
-def start(port: int = 0, open_delay: float = 0.0) -> tuple[ThreadingHTTPServer, FakeJasna]:
-    state = FakeJasna(open_delay)
+def start(port: int = 0, open_delay: float = 0.0, hang_file: str | None = None) -> tuple[ThreadingHTTPServer, FakeJasna]:
+    state = FakeJasna(open_delay, hang_file=hang_file)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -100,14 +115,16 @@ def start(port: int = 0, open_delay: float = 0.0) -> tuple[ThreadingHTTPServer, 
 
 
 if __name__ == "__main__":
-    port, delay = 8765, 0.0
+    port, delay, hang = 8765, 0.0, None
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--stream-port":
             port = int(args[i + 1])
         if a == "--open-delay":
             delay = float(args[i + 1])
-    server, _ = start(port, delay)
+        if a == "--hang-file":
+            hang = args[i + 1]
+    server, _ = start(port, delay, hang)
     print(f"fake jasna on {port}", flush=True)
     try:
         while True:

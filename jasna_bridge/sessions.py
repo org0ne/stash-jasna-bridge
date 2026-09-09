@@ -162,11 +162,14 @@ class SessionManager:
         try:
             cold = self.procs.ensure(preset)
             reused = False
-            switched = self.stream_path is not None and self.stream_path != path
             with self.lock:
-                if (not cold and self.stream_path == path and self.stream_preset == preset):
-                    status = self.jasna.status() or {}
-                    reused = bool(status.get("streaming")) and status.get("path") == path
+                switched = self.stream_path is not None and self.stream_path != path
+                candidate = (not cold and self.stream_path == path and self.stream_preset == preset)
+            if candidate:
+                # Network I/O deliberately outside self.lock: a slow or wedged Jasna
+                # must not stall heartbeats, /session and /health behind it.
+                status = self.jasna.status() or {}
+                reused = bool(status.get("streaming")) and status.get("path") == path
             if not reused:
                 if self.stream_path and self.stream_path != path:
                     log.info("switching stream %s -> %s", self.stream_path, path)
@@ -246,6 +249,7 @@ class SessionManager:
 
     def _reap_once(self) -> None:
         now = time.monotonic()
+        idle_check = False
         with self.lock:
             s = self.current
             if s and s.idle_seconds(now) >= self.cfg.heartbeat_idle_s:
@@ -261,3 +265,21 @@ class SessionManager:
                 log.info("Jasna idle for %.0f min, stopping process", self.cfg.process_idle_minutes)
                 self.procs.stop()
                 self.process_idle_since = None
+            idle_check = (self.procs.managed and self.current is None and self.preparing is None
+                          and self.procs.alive())
+        # Liveness probe outside the lock (network). A wedged Jasna otherwise sits
+        # holding VRAM until process_idle_minutes and hangs the next session.
+        if idle_check:
+            if self.procs.responsive(timeout=3.0):
+                self._unresponsive = 0
+            else:
+                self._unresponsive = getattr(self, "_unresponsive", 0) + 1
+                if self._unresponsive >= 2:
+                    log.warning("Jasna not answering /status (%d checks); stopping it so the next session restarts it",
+                                self._unresponsive)
+                    self.procs.stop()
+                    with self.lock:
+                        self.stream_path = self.stream_preset = None
+                        self.stream_idle_since = None
+                        self.process_idle_since = None
+                    self._unresponsive = 0

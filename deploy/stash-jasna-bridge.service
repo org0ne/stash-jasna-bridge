@@ -1,5 +1,16 @@
-# systemd unit: copy to /etc/systemd/system/, adjust paths/user, then
-#   systemctl daemon-reload && systemctl enable --now stash-jasna-bridge
+# systemd unit for the bridge. Two ways to install:
+#
+# System-wide (needs root):
+#   sudo cp deploy/stash-jasna-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now stash-jasna-bridge
+#
+# Per-user (no root; survives logout only with `loginctl enable-linger <user>`):
+#   mkdir -p ~/.config/systemd/user && cp deploy/stash-jasna-bridge.service ~/.config/systemd/user/
+#   (drop the User= line and change WantedBy to default.target)
+#   systemctl --user daemon-reload && systemctl --user enable --now stash-jasna-bridge
+#
+# With jasna.manage_process = true, Jasna is a child of this unit and the GPU
+# is freed when the unit stops. Logs: journalctl [--user] -u stash-jasna-bridge -f
 [Unit]
 Description=Bridge between Stash jasna-switch and jasna --stream
 After=network-online.target
@@ -12,7 +23,6 @@ WorkingDirectory=/home/scott/Projects/stash-jasna-bridge
 ExecStart=/usr/bin/python3 -m jasna_bridge -c /home/scott/Projects/stash-jasna-bridge/bridge.toml
 Restart=on-failure
 RestartSec=5
-# Jasna needs the GPU; with manage_process = true it is a child of this unit.
 KillMode=mixed
 TimeoutStopSec=30
 

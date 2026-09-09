@@ -26,11 +26,8 @@ the throwaway TLS proxy goes away.
    Stash directly (e.g. `http://127.0.0.1:7777`).
 4. Firewall on the Jasna host: allow 8770 only from the NPM host, and block
    Jasna's own 8765 from everything but localhost (Jasna binds 0.0.0.0 with
-   no auth; without this rule the bridge's auth is decorative). nftables:
-
-   ```
-   nft add rule inet filter input ip saddr 192.168.11.5 tcp dport 8770 accept
-   nft add rule inet filter input tcp dport { 8765, 8770 } drop
-   ```
+   no auth; without this rule the bridge's auth is decorative). Ready-made
+   nftables rules: `deploy/nftables-jasna.conf` (apply/persist commands in
+   its header).
 5. Plugin: Settings > Plugins > Jasna Switch > **Bridge URL** = `/jasna`
    (relative). Leave Jasna URL empty.

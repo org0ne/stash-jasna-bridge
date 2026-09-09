@@ -158,8 +158,9 @@ class ProcessManager:
     def _start(self, preset: str) -> None:
         cmd = self.command(preset)
         log.info("starting Jasna: %s", " ".join(cmd[:6]) + (" ..." if len(cmd) > 6 else ""))
+        cwd = self.cfg.jasna_workdir or os.path.dirname(os.path.abspath(self.cfg.jasna_binary)) or None
         try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True, cwd=cwd)
         except OSError as err:
             raise JasnaError(f"could not start Jasna: {err}") from err
         self.running_preset = preset

@@ -35,6 +35,7 @@ class Config:
     jasna_url: str = "http://127.0.0.1:8765"
     manage_process: bool = False
     jasna_binary: str = ""
+    jasna_workdir: str = ""  # cwd for the spawned process; default: the binary's directory
     jasna_stream_port: int = 8765
     jasna_common_flags: list[str] = field(default_factory=list)
     jasna_start_timeout_s: float = 180.0
@@ -87,6 +88,7 @@ def from_dict(data: dict) -> Config:
     cfg.jasna_url = _get(jasna, "url", cfg.jasna_url).rstrip("/")
     cfg.manage_process = _get(jasna, "manage_process", cfg.manage_process)
     cfg.jasna_binary = _get(jasna, "binary", cfg.jasna_binary)
+    cfg.jasna_workdir = _get(jasna, "workdir", cfg.jasna_workdir)
     cfg.jasna_stream_port = _get(jasna, "stream_port", cfg.jasna_stream_port)
     cfg.jasna_common_flags = list(_get(jasna, "common_flags", []))
     cfg.jasna_start_timeout_s = _get(jasna, "start_timeout_s", cfg.jasna_start_timeout_s)

@@ -41,8 +41,15 @@ flags = []
 [session]
 heartbeat_idle_s = 90       # release the owner after this long without a heartbeat or segment fetch
 stream_linger_s = 120       # keep Jasna's stream open this long after release (warm ON/OFF/ON)
+takeover_idle_s = 20        # a forced request may pre-empt an owner idle at least this long
 
 [auth]
 mode = "none"               # none | token | stash_cookie
 token = ""                  # for mode = token; the plugin sends it as Authorization: Bearer
 cache_s = 300               # stash_cookie: how long a validated cookie stays trusted
+
+[cache]                     # Phase C (segment cache) - not yet wired up; fields reserved
+enabled = true
+dir = ""                    # default: ~/.cache/stash-jasna-bridge/segments
+max_gb = 5
+version = ""                # cache-key salt; default parsed from jasna.binary path

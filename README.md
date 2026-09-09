@@ -38,14 +38,14 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/session` | `{scene_id, time?, preset?}` → `{token, playlist_path, reused, cold, switched, ready_seconds, heartbeat_seconds, duration}`; **409** `{error:"busy", reason, scene_id, idle_seconds, ...}` when someone else owns Jasna |
+| POST | `/session` | `{scene_id, time?, preset?, force?}` → `{token, playlist_path, reused, cold, switched, ready_seconds, heartbeat_seconds, duration}`; **409** `{error:"busy", reason, scene_id, idle_seconds, takeover_available, ...}` when someone else owns Jasna |
 | POST | `/session/{token}/heartbeat` | `{time, paused}` every ~30s while ON; **410** once the session is gone |
 | DELETE | `/session/{token}` | toggle OFF / scene change |
 | POST | `/session/{token}/end` | same, for `navigator.sendBeacon` on `pagehide` |
 | GET | `/session` | current owner, lingering stream, stats |
 | GET | `/hls/{token}/stream.m3u8` | Jasna's VOD manifest, only for the live token |
 | GET | `/hls/{token}/seg_NNNNN.ts` | segment proxied from Jasna (blocks while it renders) |
-| GET | `/presets` | preset names, default, currently running |
+| GET | `/presets` | preset names, default, currently running, warm |
 | GET | `/health` | Jasna reachable/streaming/managed/pid/warm + session snapshot |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
@@ -57,6 +57,12 @@ optional `[[paths.map]]` rewrites.
 - **Ownership.** One session at a time. A second `POST /session` gets 409
   while the owner is alive. The token is the credential for heartbeat, end
   and HLS routes, so a stale tab cannot pull the new owner's segments.
+- **Takeover.** A 409 reports `takeover_available: true` once the current
+  owner has been idle at least `session.takeover_idle_s` (20s). A
+  `POST /session` with `force: true` then pre-empts that idle owner (a
+  fresh, active owner is never forced out). This is how a viewer reclaims
+  Jasna from a paused background tab without waiting out the full idle
+  timeout.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next
   heartbeat gets 410 and the plugin drops back to the Stash source.

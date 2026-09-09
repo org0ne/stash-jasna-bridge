@@ -197,6 +197,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.OK, {
             "default": cfg.default_preset,
             "running": self.bridge.sessions.procs.running_preset if cfg.manage_process else None,
+            "warm": self.bridge.sessions.is_warm(),
+            "manage_process": cfg.manage_process,
             "presets": [{"name": p.name, "description": p.description} for p in cfg.presets.values()],
         })
 
@@ -215,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
         if b.cfg.manage_process is False and preset != b.cfg.default_preset:
             return self.error(HTTPStatus.BAD_REQUEST, "preset switching needs jasna.manage_process = true")
         time_s = float(body.get("time") or 0)
+        force = bool(body.get("force"))
         try:
             stash_path, duration = b.stash.scene_path(scene_id)
         except StashError as err:
@@ -222,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
         path = b.map_path(stash_path)
         t0 = time.monotonic()
         try:
-            session, info = b.sessions.create(scene_id, path, preset, time_s, self.client_ip())
+            session, info = b.sessions.create(scene_id, path, preset, time_s, self.client_ip(), force=force)
         except Busy as busy:
             return self.send_json(HTTPStatus.CONFLICT, {"error": "busy", **busy.payload})
         except JasnaError as err:

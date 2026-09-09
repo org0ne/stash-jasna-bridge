@@ -139,16 +139,25 @@ class SessionManager:
             return s
 
     # ----- commands -----
-    def create(self, scene_id: str, path: str, preset: str, time_s: float, client: str) -> tuple[Session, dict]:
+    def create(self, scene_id: str, path: str, preset: str, time_s: float, client: str,
+               force: bool = False) -> tuple[Session, dict]:
         with self.lock:
             now = time.monotonic()
             if self.preparing:
                 raise Busy({"reason": "preparing", "scene_id": self.preparing["scene_id"],
-                            "owner_since": round(now - self.preparing["since"], 1), "idle_seconds": 0})
+                            "owner_since": round(now - self.preparing["since"], 1), "idle_seconds": 0,
+                            "takeover_available": False})
             if self.current:
-                if self.current.idle_seconds(now) < self.cfg.heartbeat_idle_s:
-                    raise Busy({"reason": "active", **self.current.public(self.cfg.heartbeat_idle_s)})
-                self._release(self.current, "idle (pre-empted)")
+                idle = self.current.idle_seconds(now)
+                if idle >= self.cfg.heartbeat_idle_s:
+                    self._release(self.current, "idle (pre-empted)")
+                elif force and idle >= self.cfg.takeover_idle_s:
+                    self._release(self.current, f"taken over by {client} (owner idle {idle:.0f}s)")
+                else:
+                    payload = {"reason": "active", **self.current.public(self.cfg.heartbeat_idle_s)}
+                    payload["takeover_available"] = idle >= self.cfg.takeover_idle_s
+                    payload["takeover_idle_s"] = self.cfg.takeover_idle_s
+                    raise Busy(payload)
             self.preparing = {"scene_id": scene_id, "since": now}
         try:
             cold = self.procs.ensure(preset)

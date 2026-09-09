@@ -122,6 +122,32 @@ class SessionFlow(unittest.TestCase):
         st, snap, _ = h.call("GET", "/session")
         self.assertIsNone(snap["stream"]["path"])
 
+    def test_takeover_when_owner_idle(self):
+        self.h.close()
+        self.h = BridgeHarness({"session": {"heartbeat_idle_s": 5, "takeover_idle_s": 0.4, "stream_linger_s": 0.6, "reaper_interval_s": 0.1}})
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        # fresh owner: not takeover-able yet
+        st, busy, _ = h.call("POST", "/session", {"scene_id": "2"})
+        self.assertEqual(st, 409); self.assertFalse(busy["takeover_available"])
+        st, denied, _ = h.call("POST", "/session", {"scene_id": "2", "force": True})
+        self.assertEqual(st, 409, denied)  # force too early is still refused
+        time.sleep(0.6)  # owner now idle past takeover_idle_s but below heartbeat_idle_s
+        st, busy2, _ = h.call("POST", "/session", {"scene_id": "2"})
+        self.assertEqual(st, 409); self.assertTrue(busy2["takeover_available"])
+        st, b, _ = h.call("POST", "/session", {"scene_id": "2", "force": True})
+        self.assertEqual(st, 200, b)
+        self.assertEqual(h.jasna.opens, ["/media/a/one.mp4", "/media/b/two.mp4"])
+        st, _, _ = h.call("POST", f"/session/{a['token']}/heartbeat", {})
+        self.assertEqual(st, 410)  # old owner was released
+
+    def test_presets_reports_warmth(self):
+        st, p, _ = self.h.call("GET", "/presets")
+        self.assertEqual(st, 200); self.assertFalse(p["warm"])
+        _, a, _ = self.h.call("POST", "/session", {"scene_id": "1"})
+        st, p, _ = self.h.call("GET", "/presets")
+        self.assertTrue(p["warm"]); self.assertIn("a", [x["name"] for x in p["presets"]])
+
     def test_busy_then_idle_preempt(self):
         h = self.h
         st, a, _ = h.call("POST", "/session", {"scene_id": "1"})

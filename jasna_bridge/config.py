@@ -51,11 +51,18 @@ class Config:
     heartbeat_idle_s: float = 90.0
     stream_linger_s: float = 120.0
     reaper_interval_s: float = 5.0
+    takeover_idle_s: float = 20.0   # a forced request may pre-empt an owner idle at least this long
 
     # [auth]
     auth_mode: str = "none"  # none | token | stash_cookie
     auth_token: str = ""
     auth_cache_s: float = 300.0
+
+    # [cache]
+    cache_enabled: bool = True
+    cache_dir: str = ""          # default: ~/.cache/stash-jasna-bridge/segments
+    cache_max_gb: float = 5.0
+    cache_version: str = ""      # cache-key salt; default: parsed from jasna.binary path, else "v0"
 
 
 def _get(table: dict, key: str, default):
@@ -110,6 +117,7 @@ def from_dict(data: dict) -> Config:
     cfg.heartbeat_idle_s = _get(session, "heartbeat_idle_s", cfg.heartbeat_idle_s)
     cfg.stream_linger_s = _get(session, "stream_linger_s", cfg.stream_linger_s)
     cfg.reaper_interval_s = _get(session, "reaper_interval_s", cfg.reaper_interval_s)
+    cfg.takeover_idle_s = _get(session, "takeover_idle_s", cfg.takeover_idle_s)
 
     auth = data.get("auth", {})
     cfg.auth_mode = _get(auth, "mode", cfg.auth_mode)
@@ -119,6 +127,12 @@ def from_dict(data: dict) -> Config:
     if cfg.auth_mode == "token" and not cfg.auth_token:
         raise ValueError("auth.mode = token requires auth.token")
     cfg.auth_cache_s = _get(auth, "cache_s", cfg.auth_cache_s)
+
+    cache = data.get("cache", {})
+    cfg.cache_enabled = _get(cache, "enabled", cfg.cache_enabled)
+    cfg.cache_dir = _get(cache, "dir", cfg.cache_dir)
+    cfg.cache_max_gb = _get(cache, "max_gb", cfg.cache_max_gb)
+    cfg.cache_version = _get(cache, "version", cfg.cache_version)
 
     if cfg.manage_process and not cfg.jasna_binary:
         raise ValueError("jasna.manage_process = true requires jasna.binary")

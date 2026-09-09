@@ -22,7 +22,7 @@ manage_process = false      # true: the bridge starts/stops jasna itself
 binary = ""                 # required when manage_process = true
 workdir = ""                # cwd for the spawned process (default: the binary's directory)
 log_file = ""               # managed only: append Jasna's own stdout/stderr here (pair with "--log-level", "info" in common_flags)
-stream_port = 8765
+stream_port = 8765         # use another port (and firewall it) if Stash itself also runs a Jasna on 8765
 common_flags = []           # e.g. ["--license-email", "...", "--license-key", "..."]
 start_timeout_s = 180
 open_timeout_s = 60

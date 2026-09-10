@@ -20,9 +20,26 @@ def main(argv=None) -> int:
     ap.add_argument("-c", "--config", default="bridge.toml")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+    ins = sub.add_parser("install", help="write bridge.toml + a systemd user unit and start it")
+    ins.add_argument("--stash-url", default="http://127.0.0.1:9999")
+    ins.add_argument("--presets", choices=["hq", "minimal"], default="hq",
+                     help="hq: hq+fast presets (default); minimal: Jasna defaults only")
+    ins.add_argument("--jasna-binary", default="")
+    ins.add_argument("--stream-port", type=int, default=0)
+    ins.add_argument("--no-unit", action="store_true", help="write config only, no systemd unit")
+    ins.add_argument("--force", action="store_true", help="overwrite an existing bridge.toml")
+    sub.add_parser("doctor", help="check a deployment and print pass/fail")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if args.cmd == "install":
+        from .cli import install
+        return install(args)
+    if args.cmd == "doctor":
+        from .cli import doctor
+        return doctor(args)
     try:
         cfg = config.load(args.config)
     except (OSError, ValueError) as err:

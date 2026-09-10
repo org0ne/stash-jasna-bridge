@@ -24,6 +24,37 @@ import urllib.request
 
 log = logging.getLogger("bridge.jasna")
 
+import sys as _sys
+
+
+def jasna_license_candidates() -> list[str]:
+    """Ordered candidate paths for Jasna's license.json across platforms.
+    Jasna stores it via platformdirs user_config_dir('jasna'):
+      Linux:   ~/.config/jasna/license.json (XDG_CONFIG_HOME honored)
+      macOS:   ~/Library/Application Support/jasna/license.json
+      Windows: %LOCALAPPDATA%/jasna/jasna or %APPDATA%/jasna (author dir
+               varies with how platformdirs was called), so try both.
+    First existing file wins; used for reading and for `doctor`."""
+    home = os.path.expanduser("~")
+    if _sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        roaming = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        dirs = [os.path.join(local, "jasna", "jasna"), os.path.join(local, "jasna"),
+                os.path.join(roaming, "jasna", "jasna"), os.path.join(roaming, "jasna")]
+    elif _sys.platform == "darwin":
+        dirs = [os.path.join(home, "Library", "Application Support", "jasna"),
+                os.path.join(home, ".config", "jasna")]
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        dirs = [os.path.join(xdg, "jasna"), os.path.join(home, ".config", "jasna")]
+    out, seen = [], set()
+    for d in dirs:
+        f = os.path.join(d, "license.json")
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
 
 class JasnaError(Exception):
     pass
@@ -131,11 +162,50 @@ class ProcessManager:
 
     def command(self, preset: str) -> list[str]:
         p = self.cfg.presets[preset]
+        flags = [*self.cfg.jasna_common_flags, *p.flags]
         return [
             self.cfg.jasna_binary, "--stream", "--no-browser",
             "--stream-port", str(self.cfg.jasna_stream_port),
-            *self.cfg.jasna_common_flags, *p.flags,
+            *flags, *self._license_flags(flags),
         ]
+
+    def _license_flags(self, existing: list[str]) -> list[str]:
+        """--license-email/--license-key read from Jasna's own store, so the
+        key need not be duplicated in bridge.toml. Skipped if already supplied
+        in the flags, or if the store is missing/unreadable. Cached; logged once."""
+        if "--license-email" in existing or "--license-key" in existing:
+            return []
+        cached = getattr(self, "_license_cache", "unset")
+        if cached != "unset":
+            return cached
+        if self.cfg.jasna_license_file:
+            paths = [os.path.expanduser(self.cfg.jasna_license_file)]
+        else:
+            paths = jasna_license_candidates()
+        flags: list[str] = []
+        found = None
+        for path in paths:
+            try:
+                with open(path) as fh:
+                    data = json.load(fh)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as err:
+                log.warning("cannot read Jasna license %s: %s", path, err)
+                continue
+            found = path
+            email, key = data.get("email"), data.get("key")
+            if email and key:
+                flags = ["--license-email", str(email), "--license-key", str(key)]
+                log.info("using Jasna license for %s from %s", email, path)
+            else:
+                log.warning("license file %s has no email/key; unet-4x will be disabled", path)
+            break
+        if found is None:
+            log.info("no Jasna license file found (looked in %s); running without a license",
+                     ", ".join(paths))
+        self._license_cache = flags
+        return flags
 
     def ensure(self, preset: str) -> bool:
         """Make sure a Jasna serving `preset` is up. Returns True if this call

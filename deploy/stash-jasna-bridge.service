@@ -1,16 +1,17 @@
-# systemd unit for the bridge. Two ways to install:
+# systemd USER unit for the bridge (recommended). `python3 -m jasna_bridge install`
+# writes this file with the right paths and starts it for you; this copy is the
+# reference. It uses %h (your home) so there is nothing host-specific to edit,
+# as long as the repo is at ~/Projects/stash-jasna-bridge. Install by hand:
 #
-# System-wide (needs root):
-#   sudo cp deploy/stash-jasna-bridge.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now stash-jasna-bridge
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/stash-jasna-bridge.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # so it runs when you are logged out
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now stash-jasna-bridge
 #
-# Per-user (no root; survives logout only with `loginctl enable-linger <user>`):
-#   mkdir -p ~/.config/systemd/user && cp deploy/stash-jasna-bridge.service ~/.config/systemd/user/
-#   (drop the User= line and change WantedBy to default.target)
-#   systemctl --user daemon-reload && systemctl --user enable --now stash-jasna-bridge
-#
+# Logs: journalctl --user -u stash-jasna-bridge -f
 # With jasna.manage_process = true, Jasna is a child of this unit and the GPU
-# is freed when the unit stops. Logs: journalctl [--user] -u stash-jasna-bridge -f
+# is freed when the unit stops.
 [Unit]
 Description=Bridge between Stash jasna-switch and jasna --stream
 After=network-online.target
@@ -18,13 +19,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=scott
-WorkingDirectory=/home/scott/Projects/stash-jasna-bridge
-ExecStart=/usr/bin/python3 -m jasna_bridge -c /home/scott/Projects/stash-jasna-bridge/bridge.toml
+WorkingDirectory=%h/Projects/stash-jasna-bridge
+ExecStart=/usr/bin/python3 -m jasna_bridge -c %h/Projects/stash-jasna-bridge/bridge.toml
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=30
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

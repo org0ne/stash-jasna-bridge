@@ -275,6 +275,63 @@ class Auth(unittest.TestCase):
             h.close()
 
 
+class License(unittest.TestCase):
+    """The bridge reads the Jasna license from its store so bridge.toml need not hold it."""
+
+    def _pm(self, overrides=None):
+        cfg = config.from_dict({"jasna": {"binary": "/bin/true", "manage_process": True,
+                                          "stream_port": 8765, "default_preset": "a", **(overrides or {})},
+                                "presets": {"a": {"flags": ["--x", "1"]}}})
+        from jasna_bridge.jasna import ProcessManager, JasnaClient
+        return ProcessManager(cfg, JasnaClient(cfg.jasna_url))
+
+    def test_license_flags_appended_from_file(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        lic = os.path.join(d, "license.json")
+        with open(lic, "w") as fh:
+            json.dump({"email": "a@b.c", "key": "SECRET"}, fh)
+        pm = self._pm({"license_file": lic})
+        cmd = pm.command("a")
+        self.assertEqual(cmd[cmd.index("--license-email") + 1], "a@b.c")
+        self.assertEqual(cmd[cmd.index("--license-key") + 1], "SECRET")
+
+    def test_license_not_appended_when_in_common_flags(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        lic = os.path.join(d, "license.json")
+        with open(lic, "w") as fh:
+            json.dump({"email": "a@b.c", "key": "SECRET"}, fh)
+        pm = self._pm({"license_file": lic, "common_flags": ["--license-email", "manual@x.y", "--license-key", "MANUAL"]})
+        cmd = pm.command("a")
+        self.assertEqual(cmd.count("--license-email"), 1)
+        self.assertEqual(cmd[cmd.index("--license-email") + 1], "manual@x.y")
+
+    def test_missing_license_file_is_harmless(self):
+        pm = self._pm({"license_file": "/no/such/license.json"})
+        cmd = pm.command("a")
+        self.assertNotIn("--license-email", cmd)
+
+    def test_license_candidates_are_platform_appropriate(self):
+        import importlib, jasna_bridge.jasna as jm
+        orig = sys.platform
+        try:
+            sys.platform = "win32"
+            os.environ["LOCALAPPDATA"] = r"C:\Users\bob\AppData\Local"
+            os.environ["APPDATA"] = r"C:\Users\bob\AppData\Roaming"
+            importlib.reload(jm)
+            cands = jm.jasna_license_candidates()
+            self.assertTrue(all(c.endswith("license.json") for c in cands))
+            self.assertTrue(any("Local" in c and "jasna" in c for c in cands))
+            self.assertGreaterEqual(len(cands), 2)
+            sys.platform = "darwin"
+            importlib.reload(jm)
+            self.assertTrue(any("Application Support" in c for c in jm.jasna_license_candidates()))
+        finally:
+            sys.platform = orig
+            importlib.reload(jm)
+
+
 class Cache(unittest.TestCase):
     """Phase C: segments are cached on disk; a complete stream replays with no Jasna."""
 

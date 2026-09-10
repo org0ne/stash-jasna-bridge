@@ -39,6 +39,11 @@ class Config:
     jasna_log_file: str = ""  # append Jasna's stdout/stderr here (managed only); empty = inherit
     jasna_stream_port: int = 8765
     jasna_common_flags: list[str] = field(default_factory=list)
+    # Jasna persists the supporter license at ~/.config/jasna/license.json;
+    # the bridge reads it and passes --license-email/--license-key so the key
+    # need not be duplicated in this file. Set a path to override, or put the
+    # flags in common_flags to take precedence. "" = the default location.
+    jasna_license_file: str = ""
     jasna_start_timeout_s: float = 180.0
     jasna_open_timeout_s: float = 60.0
     process_idle_minutes: float = 15.0
@@ -101,6 +106,7 @@ def from_dict(data: dict) -> Config:
     cfg.jasna_log_file = _get(jasna, "log_file", cfg.jasna_log_file)
     cfg.jasna_stream_port = _get(jasna, "stream_port", cfg.jasna_stream_port)
     cfg.jasna_common_flags = list(_get(jasna, "common_flags", []))
+    cfg.jasna_license_file = _get(jasna, "license_file", cfg.jasna_license_file)
     cfg.jasna_start_timeout_s = _get(jasna, "start_timeout_s", cfg.jasna_start_timeout_s)
     cfg.jasna_open_timeout_s = _get(jasna, "open_timeout_s", cfg.jasna_open_timeout_s)
     cfg.process_idle_minutes = _get(jasna, "process_idle_minutes", cfg.process_idle_minutes)

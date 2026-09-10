@@ -19,16 +19,38 @@ Status: Phase A of the bridge plan (foundation) — everything the PoC did,
 plus no trampling between viewers and no orphaned streams. Phases B–D
 (reverse-proxy deployment, segment cache, preset picker) build on this.
 
-## Run
+## Install
+
+Python 3.11+ (tomllib), no packages. On the Jasna host:
 
 ```sh
-cp bridge.toml.example bridge.toml   # edit; chmod 600 if it holds keys
-python3 -m jasna_bridge -c bridge.toml [-v]
+git clone <this repo> ~/Projects/stash-jasna-bridge
+cd ~/Projects/stash-jasna-bridge
+python3 -m jasna_bridge install --stash-url http://127.0.0.1:9999
 ```
 
-Python 3.11+ (tomllib), no packages. `deploy/stash-jasna-bridge.service`
-is a systemd unit; `deploy/nginx-proxy-manager.md` shows the reverse-proxy
-location and firewall rules.
+`install` finds the Jasna binary, writes `bridge.toml` and a systemd **user**
+unit, enables linger, starts it, and prints the two steps it cannot do for
+you: the firewall rule (needs sudo) and the reverse-proxy `/jasna` location.
+The Jasna license is read from Jasna's own store, so no key goes in
+`bridge.toml` (Linux `~/.config/jasna`, Windows `%LOCALAPPDATA%\jasna`,
+macOS `~/Library/Application Support/jasna`; `jasna.license_file` overrides). Then:
+
+```sh
+python3 -m jasna_bridge doctor      # pass/fail check of the whole path
+```
+
+Reverse-proxy snippets (NPM, nginx, Caddy, Cloudflare Tunnel):
+`deploy/reverse-proxy.md`. Firewall: `deploy/nftables-jasna.conf`. In Stash,
+install the **Jasna Switch** plugin; it auto-detects the bridge at
+`<stash-origin>/jasna`, so no plugin settings are needed.
+
+### Manual
+
+```sh
+cp bridge.toml.example bridge.toml   # edit; chmod 600 if it holds a token
+python3 -m jasna_bridge -c bridge.toml [-v]
+```
 
 Tests (fake Stash + fake Jasna, ~20s): `python3 -m unittest -v tests.test_bridge`
 

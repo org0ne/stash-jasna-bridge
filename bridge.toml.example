@@ -23,7 +23,12 @@ binary = ""                 # required when manage_process = true
 workdir = ""                # cwd for the spawned process (default: the binary's directory)
 log_file = ""               # managed only: append Jasna's own stdout/stderr here (pair with "--log-level", "info" in common_flags)
 stream_port = 8765         # use another port (and firewall it) if Stash itself also runs a Jasna on 8765
-common_flags = []           # e.g. ["--license-email", "...", "--license-key", "..."]
+common_flags = []           # extra flags for every preset. The license is read from
+                            #   Jasna's own store automatically (Linux ~/.config/jasna,
+                            #   Windows %LOCALAPPDATA%\jasna, macOS ~/Library/Application
+                            #   Support/jasna); only put --license-email/--license-key here
+                            #   to override it.
+# license_file = ""         # override: an explicit path to a license.json
 start_timeout_s = 180
 open_timeout_s = 60
 process_idle_minutes = 15   # managed only: stop the process after this long with no stream

@@ -130,7 +130,7 @@ optional `[[paths.map]]` rewrites.
 - **CORS.** Only for origins in `server.cors_origins` (plain-HTTP Stash on
   another origin). Under the Stash domain nothing is needed.
 
-## Measured (2026-09-08, debeast, preset rfdetr-v6-large + unet-4x)
+## Measured (preset rfdetr-v6-large + unet-4x, RTX 4090)
 
 | case | toggle → first frame |
 |---|---|
@@ -141,3 +141,8 @@ optional `[[paths.map]]` rewrites.
 Most of the remaining time is Jasna rendering the first segment; the
 plugin now passes `startPosition` to hls.js so segment 0 is no longer
 fetched for nothing.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Jasna itself is a separate program (AGPL) that
+this service only talks to over HTTP; nothing from it is bundled here.

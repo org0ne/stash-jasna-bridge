@@ -5,7 +5,7 @@
 host = "127.0.0.1"          # 0.0.0.0 / LAN IP when the reverse proxy is on another host
 port = 8770
 path_prefix = "/jasna"      # stripped when present; matches the reverse-proxy location
-cors_origins = []           # e.g. ["http://192.168.11.109:7777"] for a plain-HTTP Stash
+cors_origins = []           # e.g. ["http://192.168.1.50:7777"] for a plain-HTTP Stash
 
 [stash]
 url = "http://127.0.0.1:9999"

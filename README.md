@@ -60,14 +60,14 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/session` | `{scene_id, time?, preset?, force?}` → `{token, playlist_path, reused, cold, switched, ready_seconds, heartbeat_seconds, duration}`; **409** `{error:"busy", reason, scene_id, idle_seconds, takeover_available, ...}` when someone else owns Jasna |
+| POST | `/session` | `{scene_id, time?, preset?, flags?, force?}` → `{token, playlist_path, reused, cold, switched, ready_seconds, heartbeat_seconds, duration}`; **409** `{error:"busy", reason, scene_id, idle_seconds, takeover_available, ...}` when someone else owns Jasna. `flags` (a list of Jasna CLI tokens) makes `preset` a custom preset, see below |
 | POST | `/session/{token}/heartbeat` | `{time, paused}` every ~30s while ON; **410** once the session is gone |
 | DELETE | `/session/{token}` | toggle OFF / scene change |
 | POST | `/session/{token}/end` | same, for `navigator.sendBeacon` on `pagehide` |
 | GET | `/session` | current owner, lingering stream, stats |
 | GET | `/hls/{token}/stream.m3u8` | Jasna's VOD manifest, only for the live token |
 | GET | `/hls/{token}/seg_NNNNN.ts` | segment proxied from Jasna (blocks while it renders) |
-| GET | `/presets` | preset names, default, currently running, warm |
+| GET | `/presets` | preset names, default, currently running, warm, `custom_allowed` |
 | GET | `/health` | Jasna reachable/streaming/managed/pid/warm + session snapshot |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
@@ -122,6 +122,21 @@ optional `[[paths.map]]` rewrites.
   active), restarts it after a crash on the next request, and terminates it
   `process_idle_minutes` after the last stream closed. `prewarm_path` opens
   a clip once after each start so TensorRT engine caches exist.
+- **Custom presets (managed mode, opt-in).** With `jasna.custom_presets =
+  true`, `POST /session` may carry `flags: ["--cq", "30", ...]` next to a
+  `preset` name of the client's choosing (this is what the plugin's *Custom
+  presets* setting sends). The bridge validates the pair (a 1-40 character
+  name that does not collide with a configured preset; up to 64 string
+  tokens, none from a denylist: `--stream`, `--stream-port`,
+  `--stream-segment-duration`, `--no-browser`, `--input`, `--output`,
+  `--output-pattern`, `--working-directory`, `--segments`,
+  `--license-email`, `--license-key`, `--post-export-*`, `--benchmark*`,
+  `--help`, `--version`), then treats it like a configured preset for that
+  and later sessions: `common_flags + flags`, restart on change, its own
+  cache key. Re-sending a name with different flags restarts Jasna on the
+  new flags. Custom presets are never listed by `/presets` (the plugin
+  keeps that list) and do not survive a bridge restart. Off by default:
+  anyone who can create a session then chooses Jasna's launch flags.
 - **Auth.** `none`, `token` (Authorization: Bearer / X-Bridge-Token on
   `/session`, `/presets`), or `stash_cookie` (the browser's Stash cookie is
   forwarded to Stash GraphQL and cached for `cache_s`). Token-in-path

@@ -34,6 +34,11 @@ open_timeout_s = 60
 process_idle_minutes = 15   # managed only: stop the process after this long with no stream
 prewarm_path = ""           # managed only: clip to open once after start (TensorRT cache warm-up)
 default_preset = "default"
+custom_presets = false      # managed only: let the plugin's "Custom presets" setting (Settings >
+                            #   Plugins > Jasna Switch) send its own Jasna flags with a session.
+                            #   Anyone who can create a session then picks Jasna's launch flags,
+                            #   minus a denylist (stream/port/browser, input/output, license,
+                            #   post-export hooks, segment duration). Keep off on an open bridge.
 
 [presets.default]
 description = "Jasna defaults"

@@ -13,6 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import VERSION
+from .config import validate_custom_preset
 from .jasna import JasnaError
 from .sessions import Busy, NoSession
 from .stash import CookieValidator, StashClient, StashError
@@ -201,6 +202,7 @@ class Handler(BaseHTTPRequestHandler):
             "running": self.bridge.sessions.procs.running_preset if cfg.manage_process else None,
             "warm": self.bridge.sessions.is_warm(),
             "manage_process": cfg.manage_process,
+            "custom_allowed": bool(cfg.custom_presets and cfg.manage_process),
             "presets": [{"name": p.name, "description": p.description} for p in cfg.presets.values()],
         })
 
@@ -214,7 +216,21 @@ class Handler(BaseHTTPRequestHandler):
         if not scene_id.isdigit():
             raise ValueError("scene_id must be a numeric Stash scene id")
         preset = body.get("preset") or b.cfg.default_preset
-        if preset not in b.cfg.presets:
+        if body.get("flags") is not None:
+            # A custom preset: the plugin's "Custom presets" setting sends the
+            # flags along. Validated, then registered under its name so the
+            # rest of the bridge resolves it like a configured one.
+            if not b.cfg.manage_process:
+                return self.error(HTTPStatus.BAD_REQUEST, "custom presets need jasna.manage_process = true")
+            if not b.cfg.custom_presets:
+                return self.error(HTTPStatus.BAD_REQUEST, "custom presets are disabled (jasna.custom_presets = false)")
+            if preset in b.cfg.presets:
+                return self.error(HTTPStatus.BAD_REQUEST,
+                                  f"custom preset {preset!r} collides with a configured preset; rename it")
+            custom = validate_custom_preset(preset, body["flags"])
+            b.cfg.custom[custom.name] = custom
+            preset = custom.name
+        if not b.cfg.has_preset(preset):
             return self.error(HTTPStatus.BAD_REQUEST, f"unknown preset {preset!r}")
         if b.cfg.manage_process is False and preset != b.cfg.default_preset:
             return self.error(HTTPStatus.BAD_REQUEST, "preset switching needs jasna.manage_process = true")
@@ -279,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         if data is None:
             return self.error(HTTPStatus.BAD_GATEWAY, "Jasna has no stream open")
         if b.cache and s.cache_key:
-            b.cache.store_manifest(s.cache_key, s.path, s.preset, b.cfg.presets[s.preset].flags, data)
+            b.cache.store_manifest(s.cache_key, s.path, s.preset, b.cfg.preset(s.preset).flags, data)
         self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
 
     def h_segment(self, token: str, seg: str):

@@ -1,6 +1,7 @@
 """TOML config loading with defaults. See bridge.toml.example."""
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -49,9 +50,28 @@ class Config:
     process_idle_minutes: float = 15.0
     prewarm_path: str = ""
     default_preset: str = "default"
+    # Let POST /session carry ad-hoc flags (the plugin's "Custom presets"
+    # setting). Managed mode only. Off by default: it lets any client that can
+    # create a session choose Jasna's launch flags (see CUSTOM_FLAG_DENYLIST).
+    custom_presets: bool = False
 
     # [presets.<name>]
     presets: dict[str, Preset] = field(default_factory=dict)
+    # Ad-hoc presets registered at runtime from /session {preset, flags} when
+    # custom_presets is on. Keyed by the client-chosen name; never listed by
+    # /presets (the plugin owns that list) and never persisted.
+    custom: dict[str, Preset] = field(default_factory=dict)
+
+    def preset(self, name: str) -> Preset:
+        """Configured preset or a registered custom one; KeyError if neither."""
+        try:
+            return self.presets[name]
+        except KeyError:
+            return self.custom[name]
+
+    def has_preset(self, name: str) -> bool:
+        return name in self.presets or name in self.custom
+
 
     # [session]
     heartbeat_idle_s: float = 90.0
@@ -70,6 +90,49 @@ class Config:
     cache_dir: str = ""          # default: ~/.cache/stash-jasna-bridge/segments
     cache_max_gb: float = 5.0
     cache_version: str = ""      # cache-key salt; default: parsed from jasna.binary path, else "v0"
+
+
+# Flags a custom preset may not set: they would take the process out from
+# under the bridge (stream mode, port, browser), change what the bridge does
+# with the output (batch input/output, post-export hooks, benchmarks), or
+# invalidate the segment cache's fixed-4s assumption. Everything else
+# (models, thresholds, clip sizes, codec, LUT, ...) is fair game.
+CUSTOM_FLAG_DENYLIST = frozenset({
+    "-h", "--help", "--version", "--benchmark", "--benchmark-filter", "--benchmark-video",
+    "--input", "--output", "--output-pattern", "--working-directory", "--segments",
+    "--stream", "--stream-port", "--stream-segment-duration", "--no-browser",
+    "--license-email", "--license-key",
+    "--post-export-action", "--post-export-command", "--post-export-video-command",
+})
+CUSTOM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$")
+CUSTOM_MAX_FLAGS = 64
+CUSTOM_MAX_FLAG_LEN = 512
+
+
+def validate_custom_preset(name, flags) -> Preset:
+    """Check a /session {preset, flags} pair and return the Preset. Raises
+    ValueError with a message fit for a 400 response."""
+    if not isinstance(name, str) or not CUSTOM_NAME_RE.match(name):
+        raise ValueError("custom preset name must be 1-40 characters: letters, digits, space, . _ + -")
+    if not isinstance(flags, list) or not flags:
+        raise ValueError("custom preset flags must be a non-empty list of strings")
+    if len(flags) > CUSTOM_MAX_FLAGS:
+        raise ValueError(f"custom preset has too many flags (max {CUSTOM_MAX_FLAGS})")
+    out: list[str] = []
+    for f in flags:
+        if not isinstance(f, str) or not f.strip():
+            raise ValueError("custom preset flags must be non-empty strings")
+        if len(f) > CUSTOM_MAX_FLAG_LEN or any(ord(c) < 32 for c in f):
+            raise ValueError("custom preset flag is too long or contains control characters")
+        f = f.strip()
+        # "--flag=value" and "--flag" both count as the flag itself.
+        head = f.split("=", 1)[0] if f.startswith("-") else ""
+        if head in CUSTOM_FLAG_DENYLIST:
+            raise ValueError(f"flag {head} is not allowed in a custom preset")
+        out.append(f)
+    if not out[0].startswith("-"):
+        raise ValueError(f"custom preset flags must start with a flag, not {out[0]!r}")
+    return Preset(name, out, "custom")
 
 
 def _get(table: dict, key: str, default):
@@ -112,6 +175,7 @@ def from_dict(data: dict) -> Config:
     cfg.process_idle_minutes = _get(jasna, "process_idle_minutes", cfg.process_idle_minutes)
     cfg.prewarm_path = _get(jasna, "prewarm_path", cfg.prewarm_path)
     cfg.default_preset = _get(jasna, "default_preset", cfg.default_preset)
+    cfg.custom_presets = _get(jasna, "custom_presets", cfg.custom_presets)
 
     for name, table in data.get("presets", {}).items():
         if not isinstance(table, dict):

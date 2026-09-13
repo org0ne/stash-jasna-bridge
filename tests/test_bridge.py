@@ -614,5 +614,90 @@ class Managed(unittest.TestCase):
             h.close()
 
 
+class CustomPresets(unittest.TestCase):
+    """POST /session {preset, flags}: ad-hoc presets from the plugin's setting."""
+
+    def test_validation(self):
+        from jasna_bridge.config import validate_custom_preset
+        p = validate_custom_preset("my hq", ["--detection-model", "rfdetr-v6-large", "--cq", "30"])
+        self.assertEqual((p.name, p.flags, p.description), ("my hq", ["--detection-model", "rfdetr-v6-large", "--cq", "30"], "custom"))
+        for name, flags in [
+            ("", ["--cq", "30"]), ("x" * 41, ["--cq", "30"]), ("bad/name", ["--cq", "30"]),
+            ("ok", []), ("ok", "--cq 30"), ("ok", ["cq", "30"]), ("ok", [""]), ("ok", ["--cq", 30]),
+            ("ok", ["--stream-port", "1"]), ("ok", ["--license-key=abc"]), ("ok", ["--output", "/tmp/x"]),
+            ("ok", ["--cq", "3\n0"]), ("ok", ["--cq"] * 65),
+        ]:
+            with self.assertRaises(ValueError, msg=f"{name!r} {flags!r}"):
+                validate_custom_preset(name, flags)
+
+    def test_rejected_unless_enabled_and_managed(self):
+        h = BridgeHarness()  # unmanaged, custom off
+        try:
+            st, p, _ = h.call("GET", "/presets")
+            self.assertFalse(p["custom_allowed"])
+            st, body, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "30"]})
+            self.assertEqual(st, 400); self.assertIn("manage_process", body["error"])
+        finally:
+            h.close()
+        h = BridgeHarness(managed=True)  # managed, custom off
+        try:
+            st, p, _ = h.call("GET", "/presets")
+            self.assertFalse(p["custom_allowed"])
+            st, body, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "30"]})
+            self.assertEqual(st, 400); self.assertIn("disabled", body["error"])
+            self.assertFalse(h.procs.alive())
+        finally:
+            h.close()
+
+    def test_custom_preset_runs_and_restarts_on_flag_change(self):
+        def cq(cmd):  # the license flags may follow the preset's, so look --cq up by name
+            return cmd[cmd.index("--cq") + 1]
+        h = BridgeHarness({"jasna": {"custom_presets": True}}, managed=True)
+        try:
+            st, p, _ = h.call("GET", "/presets")
+            self.assertTrue(p["custom_allowed"])
+            self.assertEqual([x["name"] for x in p["presets"]], ["a", "b"])  # customs are never listed
+            # bad requests never touch the process
+            st, body, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "a", "flags": ["--cq", "30"]})
+            self.assertEqual(st, 400); self.assertIn("collides", body["error"])
+            st, body, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--stream-port", "9"]})
+            self.assertEqual(st, 400); self.assertIn("not allowed", body["error"])
+            self.assertFalse(h.procs.alive())
+
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "30"]})
+            self.assertEqual(st, 200, a); self.assertTrue(a["cold"]); self.assertEqual(a["preset"], "mine")
+            pid1 = h.procs.pid()
+            self.assertEqual(h.procs.running_preset, "mine")
+            self.assertEqual(cq(h.procs.command("mine")), "30")
+            st, _, _ = h.call("GET", f"/hls/{a['token']}/seg_00000.ts"); self.assertEqual(st, 200)
+            st, p, _ = h.call("GET", "/presets"); self.assertEqual(p["running"], "mine")
+            h.call("DELETE", f"/session/{a['token']}")
+
+            # same name, same flags: the lingering stream is reused, no restart
+            st, b, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "30"]})
+            self.assertEqual(st, 200, b); self.assertFalse(b["cold"]); self.assertTrue(b["reused"])
+            self.assertEqual(h.procs.pid(), pid1)
+            h.call("DELETE", f"/session/{b['token']}")
+
+            # same name, edited flags: Jasna restarts on the new flags and the cache key differs
+            st, c, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "20"]})
+            self.assertEqual(st, 200, c); self.assertTrue(c["cold"]); self.assertFalse(c["reused"])
+            self.assertNotEqual(h.procs.pid(), pid1)
+            self.assertEqual(cq(h.procs.command("mine")), "20")
+            self.assertEqual(h.sessions.current.cache_key, h.cache.key("/media/a/one.mp4", "mine", ["--cq", "20"]))
+            self.assertNotEqual(h.sessions.current.cache_key, h.cache.key("/media/a/one.mp4", "mine", ["--cq", "30"]))
+            h.call("DELETE", f"/session/{c['token']}")
+
+            # a configured preset still works alongside, and a bare custom name
+            # (no flags) resolves to what was last registered under it
+            st, d, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "b"})
+            self.assertEqual(st, 200, d); self.assertEqual(h.procs.running_preset, "b")
+            h.call("DELETE", f"/session/{d['token']}")
+            st, e, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine"})
+            self.assertEqual(st, 200, e); self.assertEqual(cq(h.procs.command("mine")), "20")
+        finally:
+            h.close()
+
+
 if __name__ == "__main__":
     unittest.main()

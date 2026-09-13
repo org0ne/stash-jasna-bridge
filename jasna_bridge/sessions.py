@@ -179,7 +179,7 @@ class SessionManager:
                     payload["takeover_idle_s"] = self.cfg.takeover_idle_s
                     raise Busy(payload)
             self.preparing = {"scene_id": scene_id, "since": now}
-        key = self.cache.key(path, preset, self.cfg.presets[preset].flags) if self.cache else ""
+        key = self.cache.key(path, preset, self.cfg.preset(preset).flags) if self.cache else ""
         try:
             if key and self.cache.is_complete(key):
                 # Every segment is on disk: no Jasna, no GPU. A miss (eviction
@@ -259,7 +259,8 @@ class SessionManager:
                 have = self.stream_path == s.path and self.stream_preset == s.preset
             if have and not self.procs.managed:
                 return s
-            if have and self.procs.alive() and (self.jasna.status() or {}).get("path") == s.path:
+            if (have and self.procs.alive() and self.procs.matches(s.preset)
+                    and (self.jasna.status() or {}).get("path") == s.path):
                 return s
             log.info("session %s: cache miss, opening Jasna for %s", s.token[:8], s.path)
             self.procs.ensure(s.preset)

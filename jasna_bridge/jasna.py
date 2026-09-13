@@ -142,6 +142,7 @@ class ProcessManager:
         self.client = client
         self.proc: subprocess.Popen | None = None
         self.running_preset: str | None = None
+        self.running_flags: list[str] | None = None  # so a custom preset re-sent with new flags restarts
         self.started_at: float | None = None
         self.prewarmed = False
         self._lock = threading.RLock()
@@ -160,8 +161,16 @@ class ProcessManager:
         with self._lock:
             return self.proc.pid if self.proc and self.proc.poll() is None else None
 
+    def matches(self, preset: str) -> bool:
+        """True if the running process was started for `preset` with the flags
+        that name currently resolves to (a custom preset can be re-sent with
+        different flags under the same name)."""
+        with self._lock:
+            return (self.running_preset == preset
+                    and self.running_flags == list(self.cfg.preset(preset).flags))
+
     def command(self, preset: str) -> list[str]:
-        p = self.cfg.presets[preset]
+        p = self.cfg.preset(preset)
         flags = [*self.cfg.jasna_common_flags, *p.flags]
         return [
             self.cfg.jasna_binary, "--stream", "--no-browser",
@@ -216,7 +225,7 @@ class ProcessManager:
             return False
         with self._lock:
             if self.proc is not None and self.proc.poll() is None:
-                if self.running_preset == preset:
+                if self.matches(preset):
                     if self.responsive():
                         return False
                     # Seen 2026-09-08: an ffmpeg child wedged, Jasna's single-threaded
@@ -257,6 +266,7 @@ class ProcessManager:
             if out is not None:
                 out.close()  # the child holds its own descriptor
         self.running_preset = preset
+        self.running_flags = list(self.cfg.preset(preset).flags)
         self.started_at = time.monotonic()
         deadline = self.started_at + self.cfg.jasna_start_timeout_s
         while time.monotonic() < deadline:
@@ -337,4 +347,5 @@ class ProcessManager:
                 pass
             self.proc = None
             self.running_preset = None
+            self.running_flags = None
             self.started_at = None

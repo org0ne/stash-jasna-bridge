@@ -98,6 +98,20 @@ optional `[[paths.map]]` rewrites.
   without opening Jasna at all. A miss on such a session (eviction made a
   hole) opens Jasna on demand for that file. `/health` reports the cache
   under `cache`.
+- **Seams.** Jasna's segments do not sit on its playlist's fixed 4s grid
+  (measured on 0.10.0): the first segment of a render pass starts seconds
+  early and runs 5-12s, later ones drift, so two passes disagree about where
+  segment N begins. Two adjacent segments from different passes give hls.js
+  a hole or an overlap there, and a cache that mixed passes replayed that
+  seam at the same timestamp on every visit (the "strobe, then a second of
+  black" loop). So the bridge reads every segment's real PTS span
+  (`jasna_bridge/mpegts.py`) and, on sequential playback, refuses a cached
+  segment that does not meet the one it just served (`seam_rejects` in the
+  cache stats: it is re-rendered and the stale copy replaced). Once a
+  session is being fed by Jasna's live pass it stays on that pass rather
+  than dipping back into the cache (`pass_bypasses`), which also converges
+  the cache on one pass. A seek still lands on the cache when it can. The
+  one seam this cannot remove is Jasna's own first-of-pass segment.
 - **Stall recovery.** Two failures are watched for. If Jasna stops
   answering `/status` at all (a wedged HTTP server), the reaper restarts it
   after two missed probes. If `/status` still answers but the render pass

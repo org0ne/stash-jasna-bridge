@@ -17,6 +17,54 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEGMENT_SECONDS = 4.0
 
+# Segments are real (minimal) MPEG-TS so the bridge's span parser sees them:
+# one video PES per frame, PTS only. The timeline copies what Jasna 0.10.0
+# does (measured 2026-09-30): the first segment of a pass starts PASS_LEAD_S
+# early and runs to where the *next* segment's nominal start + MUX_DELAY_S is,
+# every later segment starts at 4N + MUX_DELAY_S + DRIFT_S per segment since
+# the pass began. A request for anything but the next sequential segment
+# starts a new pass there, like Jasna's "seek requested, cancelling pass".
+FRAMES_PER_SEGMENT = 10
+MUX_DELAY_S = 1.4
+PASS_LEAD_S = 2.0
+DRIFT_S = 0.004
+SEG_BYTES = 188 * FRAMES_PER_SEGMENT
+
+
+def _ts_packet(pid: int, payload: bytes, pusi: bool, cc: int) -> bytes:
+    pad = 184 - len(payload)
+    hdr = bytes([0x47, (0x40 if pusi else 0) | (pid >> 8), pid & 0xFF])
+    if pad:
+        af = bytes([pad - 1]) + (b"\x00" + b"\xff" * (pad - 2) if pad >= 2 else b"")
+        return hdr + bytes([0x30 | (cc & 0xF)]) + af + payload
+    return hdr + bytes([0x10 | (cc & 0xF)]) + payload
+
+
+def _pes_video(pts90k: int, body: bytes) -> bytes:
+    p = pts90k
+    pts = bytes([0x21 | ((p >> 29) & 0x0E), (p >> 22) & 0xFF, 0x01 | ((p >> 14) & 0xFE), (p >> 7) & 0xFF,
+                 0x01 | ((p << 1) & 0xFE)])
+    return b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + pts + body
+
+
+def ts_segment(start_s: float, end_s: float, label: bytes = b"") -> bytes:
+    """A segment whose video PTS run from start_s to (just under) end_s."""
+    frame = (end_s - start_s) / FRAMES_PER_SEGMENT
+    out = []
+    for i in range(FRAMES_PER_SEGMENT):
+        pts = int(round((start_s + i * frame) * 90000))
+        out.append(_ts_packet(0x100, _pes_video(pts, label[:150]), True, i))
+    return b"".join(out)
+
+
+def jasna_like_span(index: int, pass_start: int) -> tuple[float, float]:
+    """Where Jasna would put segment `index` of a pass that began at `pass_start`."""
+    nxt = (index + 1) * SEGMENT_SECONDS + MUX_DELAY_S
+    if index == pass_start:
+        return max(0.0, index * SEGMENT_SECONDS - PASS_LEAD_S), nxt
+    drift = DRIFT_S * (index - pass_start)
+    return index * SEGMENT_SECONDS + MUX_DELAY_S + drift, nxt + drift
+
 
 class FakeJasna:
     def __init__(self, open_delay: float = 0.0, duration: float = 40.0, hang_file: str | None = None,
@@ -34,7 +82,21 @@ class FakeJasna:
         self.opens: list[str] = []
         self.stops = 0
         self.segments: list[str] = []
+        self.passes: list[int] = []     # segment index each render pass started at
+        self.last_seg: int | None = None
         self.lock = threading.Lock()
+
+    def render(self, name: str) -> bytes:
+        """Serve seg_NNNNN.ts the way Jasna's pass would, starting a new pass
+        when the request is not the next sequential segment."""
+        index = int(name[4:9])
+        with self.lock:
+            if self.last_seg is None or index != self.last_seg + 1:
+                self.passes.append(index)
+            self.last_seg = index
+            self.segments.append(name)
+            start, end = jasna_like_span(index, self.passes[-1])
+        return ts_segment(start, end, name.encode() + b":")
 
     def playlist(self) -> str:
         n = int(self.duration // SEGMENT_SECONDS) + 1
@@ -89,10 +151,7 @@ def make_handler(state: FakeJasna):
                             return self.reply(503, b"segment not ready", "text/plain")
                     except OSError:
                         pass
-                with state.lock:
-                    state.segments.append(self.path[1:])
-                body = (self.path[1:] + ":").encode() + b"\x47" * 188 * 8
-                return self.reply(200, body, "video/mp2t")
+                return self.reply(200, state.render(self.path[1:]), "video/mp2t")
             self.reply(404, b"not found", "text/plain")
 
         def do_POST(self):
@@ -108,6 +167,7 @@ def make_handler(state: FakeJasna):
                 with state.lock:
                     state.path = path
                     state.opens.append(path)
+                    state.last_seg = None  # a new file: the next request starts a pass
                 return self.reply(200, b'{"ok":true}')
             if self.path == "/stop":
                 with state.lock:

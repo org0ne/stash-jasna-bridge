@@ -298,26 +298,52 @@ class Handler(BaseHTTPRequestHandler):
             b.cache.store_manifest(s.cache_key, s.path, s.preset, b.cfg.preset(s.preset).flags, data)
         self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
 
+    # Adjacent segments whose video does not meet within this many seconds are
+    # from different Jasna passes (measured seams: 1.7-7s; same-pass joins: <0.1s).
+    SEAM_TOLERANCE_S = 0.5
+
     def h_segment(self, token: str, seg: str):
         b = self.bridge
         s = b.sessions.touch_segment(token)
+        index = int(seg[4:9])
         key = s.cache_key if b.cache else ""
+        sequential = key and s.last_seg == index - 1
+        fn = None
         if key:
-            fn = b.cache.hit(key, seg)
-            if fn:
-                try:
-                    with open(fn, "rb") as fh:
-                        body = fh.read()
-                except OSError:
-                    body = None
-                if body:
-                    b.sessions.segment_served(token)
-                    return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "hit"})
-            if s.lazy:
-                try:
-                    b.sessions.ensure_stream(token)
-                except JasnaError as err:
-                    return self.error(HTTPStatus.BAD_GATEWAY, str(err))
+            if sequential and s.last_seg_source == "jasna":
+                # Riding Jasna's live pass: its next segment is already rendered
+                # and guaranteed to line up; a cached copy from some earlier
+                # pass may not be. Stay on the pass (and refresh the cache).
+                if b.cache.has(key, seg):
+                    b.cache.stats["pass_bypasses"] += 1
+            else:
+                fn = b.cache.hit(key, seg)
+                if fn and sequential and s.last_seg_source == "cache" and s.last_seg_end is not None:
+                    span = b.cache.span(key, seg)
+                    if span is not None and abs(span[0] - s.last_seg_end) > self.SEAM_TOLERANCE_S:
+                        # Cached from a different pass than the segment before it:
+                        # hls.js would get a hole or overlap here, and would get it
+                        # again on every visit. Re-render instead.
+                        log.info("session %s: cached %s starts at %.2fs but %s ended at %.2fs; "
+                                 "re-fetching from Jasna", token[:8], seg, span[0], f"seg_{index - 1:05d}",
+                                 s.last_seg_end)
+                        b.cache.stats["seam_rejects"] += 1
+                        fn = None
+        if fn:
+            try:
+                with open(fn, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                body = None
+            if body:
+                span = b.cache.span(key, seg)
+                b.sessions.segment_served(token, index, span[1] if span else None, "cache")
+                return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "hit"})
+        if key and s.lazy:
+            try:
+                b.sessions.ensure_stream(token)
+            except JasnaError as err:
+                return self.error(HTTPStatus.BAD_GATEWAY, str(err))
         jasna = b.sessions.jasna
         try:
             upstream = jasna.open_segment(seg)
@@ -327,13 +353,14 @@ class Handler(BaseHTTPRequestHandler):
             if upstream.status != 200:
                 upstream.read()
                 return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
-            b.sessions.segment_served(token)  # Jasna produced it: pipeline is alive
             if key:
                 # Whole segment in memory (a few MB) so the cache write is atomic
                 # and the client never sees a partial file.
                 body = upstream.read()
-                b.cache.put(key, seg, body)
+                span = b.cache.put(key, seg, body)
+                b.sessions.segment_served(token, index, span[1] if span else None, "jasna")  # pipeline is alive
                 return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "miss"})
+            b.sessions.segment_served(token, index, None, "jasna")  # Jasna produced it: pipeline is alive
             length = upstream.getheader("Content-Length")
             if length is None:
                 body = upstream.read()

@@ -12,6 +12,10 @@ segmentation keeps segment indices stable, so (key, segment name) is safe.
   miss - eviction can make holes - opens Jasna on demand.
 - Eviction is LRU by total bytes; evicting from a complete stream makes it
   incomplete again.
+- Each segment's real PTS span (mpegts.segment_span) is remembered so the
+  server can refuse to serve a cached segment that does not line up with the
+  one it served just before: Jasna's passes disagree about where segment N
+  starts by seconds, and a cache that mixes passes replays the seam forever.
 """
 from __future__ import annotations
 
@@ -23,6 +27,8 @@ import re
 import shutil
 import threading
 import time
+
+from .mpegts import segment_span
 
 log = logging.getLogger("bridge.cache")
 
@@ -47,8 +53,11 @@ class SegmentCache:
         self.entries: dict[tuple[str, str], tuple[int, float]] = {}  # (key, seg) -> (bytes, last_used)
         self.segs: dict[str, set[str]] = {}                            # key -> cached segment names
         self.metas: dict[str, dict] = {}                               # key -> meta.json contents
+        self.spans: dict[tuple[str, str], tuple[float, float] | None] = {}  # (key, seg) -> PTS span, parsed lazily
         self.total = 0
-        self.stats = {"hits": 0, "misses": 0, "stored": 0, "evictions": 0, "bytes_from_cache": 0}
+        self.stats = {"hits": 0, "misses": 0, "stored": 0, "evictions": 0, "bytes_from_cache": 0,
+                      "seam_rejects": 0,   # cached copy skipped: not continuous with the segment served before it
+                      "pass_bypasses": 0}  # cached copy skipped: session is riding Jasna's live pass
         os.makedirs(self.dir, exist_ok=True)
         self._scan()
         log.info("segment cache at %s: %d segments, %.2f GB of %.2f GB, jasna version %s",
@@ -154,9 +163,34 @@ class SegmentCache:
             self.stats["bytes_from_cache"] += entry[0]
             return fn
 
-    def put(self, key: str, seg: str, data: bytes) -> None:
+    def has(self, key: str, seg: str) -> bool:
+        with self.lock:
+            return (key, seg) in self.entries
+
+    def span(self, key: str, seg: str) -> tuple[float, float] | None:
+        """(start, end) seconds of a cached segment's video, parsed once."""
+        with self.lock:
+            if (key, seg) in self.spans:
+                return self.spans[(key, seg)]
+            if (key, seg) not in self.entries:
+                return None
+        try:
+            with open(self.file_path(key, seg), "rb") as fh:
+                span = segment_span(fh.read())
+        except OSError:
+            span = None
+        with self.lock:
+            self.spans[(key, seg)] = span
+        return span
+
+    def put(self, key: str, seg: str, data: bytes) -> tuple[float, float] | None:
+        """Store a segment; returns its PTS span (None if not parseable)."""
         if not SEG_RE.match(seg) or not data:
-            return
+            return None
+        span = segment_span(data)
+        if span is None and not getattr(self, "_warned_unparseable", False):
+            self._warned_unparseable = True
+            log.warning("segment %s/%s is not a parseable MPEG-TS; seam checks are off for such segments", key, seg)
         kd = self._key_dir(key)
         fn = self.file_path(key, seg)
         tmp = fn + ".tmp"
@@ -171,19 +205,22 @@ class SegmentCache:
                 os.unlink(tmp)
             except OSError:
                 pass
-            return
+            return span
         with self.lock:
             old = self.entries.get((key, seg))
             if old:
                 self.total -= old[0]
             self.entries[(key, seg)] = (len(data), time.time())
+            self.spans[(key, seg)] = span
             self.segs.setdefault(key, set()).add(seg)
             self.total += len(data)
             self.stats["stored"] += 1
             self._evict()
             self._refresh_complete(key, persist=False)
+        return span
 
     def _forget(self, key: str, seg: str) -> None:
+        self.spans.pop((key, seg), None)
         entry = self.entries.pop((key, seg), None)
         if entry:
             self.total -= entry[0]

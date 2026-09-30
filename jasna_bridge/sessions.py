@@ -56,6 +56,13 @@ class Session:
     segments: int = 0
     cache_key: str = ""   # segment-cache key for (path, preset flags, jasna version); "" = cache off
     lazy: bool = False    # served from a complete cache; Jasna is opened only on a miss
+    # The segment delivered last: index, where its video ends (s), and whether
+    # it came from the cache or from Jasna's live pass. The next sequential
+    # request is checked against it so the player never gets two adjacent
+    # segments from passes that disagree about the timeline.
+    last_seg: int | None = None
+    last_seg_end: float | None = None
+    last_seg_source: str = ""
 
     def idle_seconds(self, now: float | None = None) -> float:
         return (now or time.monotonic()) - self.last_activity
@@ -283,14 +290,19 @@ class SessionManager:
             s.segments += 1
             return s
 
-    def segment_served(self, token: str) -> None:
+    def segment_served(self, token: str, index: int | None = None, end: float | None = None,
+                       source: str = "") -> None:
         """A segment was actually delivered to the client, from cache or from
         Jasna. Keeps the pipeline-stall clock alive: a slow-but-live pass still
-        serves one every few seconds, only a real stall goes quiet."""
+        serves one every few seconds, only a real stall goes quiet. Also
+        records which segment it was (and where its video ends) for the seam
+        check on the next sequential request."""
         with self.lock:
             s = self.current
             if s is not None and secrets.compare_digest(s.token, token):
                 s.last_seg_served = time.monotonic()
+                if index is not None:
+                    s.last_seg, s.last_seg_end, s.last_seg_source = index, end, source
 
     def end(self, token: str) -> None:
         with self.lock:

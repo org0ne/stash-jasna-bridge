@@ -88,6 +88,7 @@ class JasnaClient:
             with self._request("POST", "/open", body, timeout=max(self.timeout, 30)) as resp:
                 resp.read()
         except urllib.error.HTTPError as err:
+            err.close()  # an HTTPError holds the response socket open until closed
             raise JasnaError(f"/open returned HTTP {err.code}") from err
         except (urllib.error.URLError, OSError) as err:
             raise JasnaError(f"/open failed: {err}") from err
@@ -106,7 +107,8 @@ class JasnaClient:
         try:
             with self._request("GET", "/stream.m3u8", timeout=5.0) as resp:
                 return resp.read()
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as err:
+            err.close()  # wait_ready() polls this every 0.25s; each 404 leaked a socket
             return None
         except (urllib.error.URLError, OSError):
             return None
@@ -120,8 +122,9 @@ class JasnaClient:
         return False
 
     def open_segment(self, name: str, timeout: float = 45.0) -> http.client.HTTPResponse:
-        """Open a streaming GET for a segment. Caller must close the response
-        (which also closes the connection)."""
+        """Open a GET for a segment. The caller must close the response;
+        closing it also closes the connection (HTTPResponse.close() alone
+        leaves an HTTP/1.1 connection's socket open: one leak per segment)."""
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         try:
             conn.request("GET", "/" + name)
@@ -129,7 +132,15 @@ class JasnaClient:
         except BaseException:
             conn.close()
             raise
-        resp._bridge_conn = conn  # keep the connection alive with the response
+        close_resp = resp.close
+
+        def close() -> None:
+            try:
+                close_resp()
+            finally:
+                conn.close()
+
+        resp.close = close
         return resp
 
 

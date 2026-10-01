@@ -38,6 +38,7 @@ class StashClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode())
         except urllib.error.HTTPError as err:
+            err.close()
             if err.code in (401, 403):
                 raise StashUnauthorized(f"Stash returned HTTP {err.code}") from err
             raise StashError(f"Stash returned HTTP {err.code}") from err

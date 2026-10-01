@@ -56,13 +56,14 @@ class Session:
     segments: int = 0
     cache_key: str = ""   # segment-cache key for (path, preset flags, jasna version); "" = cache off
     lazy: bool = False    # served from a complete cache; Jasna is opened only on a miss
-    # The segment delivered last: index, where its video ends (s), and whether
-    # it came from the cache or from Jasna's live pass. The next sequential
-    # request is checked against it so the player never gets two adjacent
-    # segments from passes that disagree about the timeline.
+    # The segment delivered last and where its video ends as the player saw
+    # it (after ts_offset). The next sequential segment is spliced onto it.
     last_seg: int | None = None
-    last_seg_end: float | None = None   # as the player saw it, i.e. after ts_offset
-    last_seg_source: str = ""
+    last_seg_end: float | None = None
+    # Bumped by every segment request. Only the newest request may record
+    # what was served: an abandoned request (the viewer seeked while Jasna was
+    # still rendering) finishing late must not overwrite the seek's state.
+    seg_req_seq: int = 0
     # Timestamp shift applied to segments on the current sequential run so a
     # new Jasna pass continues the previous one's timeline (see mpegts.restamp).
     # Reset by any non-sequential request: hls.js treats that as a seek and
@@ -167,8 +168,16 @@ class SessionManager:
             return s
 
     # ----- commands -----
+    # Custom presets kept in memory at most; the oldest one not in use is
+    # dropped when a new name arrives (they are never persisted anyway).
+    MAX_CUSTOM_PRESETS = 32
+
     def create(self, scene_id: str, path: str, preset: str, time_s: float, client: str,
-               force: bool = False) -> tuple[Session, dict]:
+               force: bool = False, custom=None) -> tuple[Session, dict]:
+        """Start a session. `custom` is a validated config.Preset from a
+        /session {preset, flags} request; it is registered only after the
+        busy check passes, so a rejected request cannot change the flags of
+        a preset another viewer's session is running on."""
         with self.lock:
             now = time.monotonic()
             if self.preparing:
@@ -192,8 +201,12 @@ class SessionManager:
                     payload["takeover_idle_s"] = self.cfg.takeover_idle_s
                     raise Busy(payload)
             self.preparing = {"scene_id": scene_id, "since": now}
+            if custom is not None:
+                self._register_custom(custom)
         key = self.cache.key(path, preset, self.cfg.preset(preset).flags) if self.cache else ""
         try:
+            if key:
+                self.cache.check_source(key, path)
             if key and self.cache.is_complete(key):
                 # Every segment is on disk: no Jasna, no GPU. A miss (eviction
                 # made a hole) opens Jasna on demand via ensure_stream().
@@ -239,10 +252,15 @@ class SessionManager:
             return session, {"reused": reused, "cold": cold, "switched": switched, "cached": False}
         except Exception:
             with self.lock:
-                if self.stream_path == path and self.jasna.playlist() is None:
-                    self.stream_path = self.stream_preset = None
-                    self.stream_idle_since = None
-                    self.process_idle_since = time.monotonic()
+                ours = self.stream_path == path
+            # Network I/O outside the lock: a wedged Jasna must not stall
+            # heartbeats behind this error path either.
+            if ours and self.jasna.playlist() is None:
+                with self.lock:
+                    if self.stream_path == path:
+                        self.stream_path = self.stream_preset = None
+                        self.stream_idle_since = None
+                        self.process_idle_since = time.monotonic()
             raise
         finally:
             with self.lock:
@@ -288,16 +306,22 @@ class SessionManager:
                 s.lazy = False
             return s
 
-    def touch_segment(self, token: str) -> Session:
+    def touch_segment(self, token: str) -> tuple[Session, dict]:
+        """Note a segment request; returns the session and a snapshot of the
+        splice state to decide against (taken under the lock, with the
+        request's sequence number for segment_served)."""
         with self.lock:
             s = self.get(token)
             now = time.monotonic()
             s.last_activity = s.last_watch = s.last_seg_request = now
             s.segments += 1
-            return s
+            s.seg_req_seq += 1
+            return s, {"seq": s.seg_req_seq, "last_seg": s.last_seg, "last_seg_end": s.last_seg_end,
+                       "ts_offset": s.ts_offset}
 
     def segment_served(self, token: str, index: int | None = None, end: float | None = None,
-                       source: str = "", ts_offset: float | None = None, seam: float | None = None) -> None:
+                       ts_offset: float | None = None, seam: float | None = None,
+                       seq: int | None = None) -> None:
         """A segment was actually delivered to the client, from cache or from
         Jasna. Keeps the pipeline-stall clock alive: a slow-but-live pass still
         serves one every few seconds, only a real stall goes quiet. Also
@@ -307,8 +331,10 @@ class SessionManager:
             s = self.current
             if s is not None and secrets.compare_digest(s.token, token):
                 s.last_seg_served = time.monotonic()
+                if seq is not None and seq != s.seg_req_seq:
+                    return  # a newer request superseded this one; its state wins
                 if index is not None:
-                    s.last_seg, s.last_seg_end, s.last_seg_source = index, end, source
+                    s.last_seg, s.last_seg_end = index, end
                 if ts_offset is not None:
                     s.ts_offset = ts_offset
                 if seam is not None:
@@ -322,6 +348,17 @@ class SessionManager:
             self._release(s, "ended by client")
 
     # ----- internals (call with lock held) -----
+    def _register_custom(self, preset) -> None:
+        custom = self.cfg.custom
+        custom.pop(preset.name, None)  # re-insert: dict order is the LRU order
+        custom[preset.name] = preset
+        in_use = {self.procs.running_preset, self.stream_preset, self.current.preset if self.current else None}
+        for name in list(custom):
+            if len(custom) <= self.MAX_CUSTOM_PRESETS:
+                break
+            if name != preset.name and name not in in_use:
+                del custom[name]
+
     def _release(self, s: Session, why: str) -> None:
         log.info("session %s released: %s (%d segments, %.0fs)", s.token[:8], why, s.segments,
                  time.monotonic() - s.created)

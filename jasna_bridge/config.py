@@ -62,17 +62,6 @@ class Config:
     # /presets (the plugin owns that list) and never persisted.
     custom: dict[str, Preset] = field(default_factory=dict)
 
-    def preset(self, name: str) -> Preset:
-        """Configured preset or a registered custom one; KeyError if neither."""
-        try:
-            return self.presets[name]
-        except KeyError:
-            return self.custom[name]
-
-    def has_preset(self, name: str) -> bool:
-        return name in self.presets or name in self.custom
-
-
     # [session]
     heartbeat_idle_s: float = 90.0
     stream_linger_s: float = 120.0
@@ -94,6 +83,16 @@ class Config:
     cache_dir: str = ""          # default: ~/.cache/stash-jasna-bridge/segments
     cache_max_gb: float = 5.0
     cache_version: str = ""      # cache-key salt; default: parsed from jasna.binary path, else "v0"
+
+    def preset(self, name: str) -> Preset:
+        """Configured preset or a registered custom one; KeyError if neither."""
+        try:
+            return self.presets[name]
+        except KeyError:
+            return self.custom[name]
+
+    def has_preset(self, name: str) -> bool:
+        return name in self.presets or name in self.custom
 
 
 # Flags a custom preset may not set: they would take the process out from

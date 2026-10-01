@@ -81,7 +81,8 @@ class BridgeHarness:
                 raw = resp.read()
                 return resp.status, (json.loads(raw) if resp.headers.get_content_type() == "application/json" else raw), resp.headers
         except urllib.error.HTTPError as err:
-            raw = err.read()
+            with err:
+                raw = err.read()
             try:
                 return err.code, json.loads(raw), err.headers
             except ValueError:
@@ -476,6 +477,7 @@ class Cache(unittest.TestCase):
         self.assertAlmostEqual(raw5[0], 18.0, places=3)                 # the cache keeps Jasna's bytes
         st, snap, _ = h.call("GET", "/session")
         self.assertEqual(snap["stats"]["seams_restamped"], 1)
+        self.assertNotIn("seam_rejects", h.cache.snapshot())
         # A seek is non-contiguous for hls.js: served as-is, offset dropped.
         st, body2, hdr2 = h.call("GET", f"/hls/{t}/seg_00002.ts")
         self.assertNotIn("X-Bridge-Offset", hdr2)
@@ -484,66 +486,82 @@ class Cache(unittest.TestCase):
         self.assertNotIn("X-Bridge-Offset", hdr3)              # same pass as 2: nothing to splice
         self.assertEqual(h.jasna.passes, [0, 8, 5])
 
-    def test_cached_segment_from_another_pass_is_rerendered_not_served(self):
+    def test_cached_segments_from_two_passes_are_spliced_not_rerendered(self):
+        """The cache holds 0-4 from a pass at 0 and 5-6 from a pass at 5 (5 is
+        first-of-pass: early and long). Replaying 4 -> 5 -> 6 comes entirely
+        from the cache, spliced into one continuous timeline, with no new
+        Jasna pass (re-rendering would cancel Jasna's pass and make a seam)."""
         h = self.h
         _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
         t = a["token"]
+        self.seg(h, t, 5); self.seg(h, t, 6)
         for i in range(5):
-            self.seg(h, t, i)                      # pass from 0: segments 0-4 cached
-        self.assertEqual(self.seg(h, t, 6)[0], "miss")  # seek: Jasna starts a pass at 6
-        self.assertEqual(h.jasna.passes, [0, 6])
-        # Later viewer plays through 4 -> 5 -> 6. 4 is a clean hit; 5 was never
-        # cached, so Jasna renders it (a pass starting at 5, first segment early
-        # and long); 6 IS cached, from the pass that began at 6, and does not
-        # meet the 5 just served: it must not be served from cache.
+            self.seg(h, t, i)
         h.call("DELETE", f"/session/{t}")
         _, b, _ = h.call("POST", "/session", {"scene_id": "1"})
         t = b["token"]
-        src4, span4 = self.seg(h, t, 4)
-        src5, span5 = self.seg(h, t, 5)
-        src6, span6 = self.seg(h, t, 6)
-        self.assertEqual((src4, src5, src6), ("hit", "miss", "miss"))
-        self.assertLess(abs(span6[0] - span5[1]), 0.1)  # what the player got is continuous
-        self.assertEqual(h.jasna.passes, [0, 6, 5])
-        self.assertEqual(h.cache.stats["pass_bypasses"], 1)   # 6 came from the live pass, not the stale copy
-        # A third viewer plays 4 -> 5 -> 6. The cached 5 is the first-of-pass
-        # segment Jasna rendered for B, starting 3.4s before 4 ends: rejected
-        # and re-rendered. Jasna starts a pass at 5 again, so that one seam
-        # (Jasna's own) remains, but the session then rides the live pass and
-        # 5 -> 6 is seamless instead of 6 arriving from a third pass.
-        h.call("DELETE", f"/session/{t}")
-        _, c, _ = h.call("POST", "/session", {"scene_id": "1"})
-        t = c["token"]
-        got = [self.seg(h, t, i) for i in (4, 5, 6)]
-        self.assertEqual([src for src, _ in got], ["hit", "miss", "miss"])
-        self.assertEqual(h.cache.stats["seam_rejects"], 1)
-        self.assertLess(abs(got[2][1][0] - got[1][1][1]), 0.1)
-        self.assertEqual(h.jasna.passes, [0, 6, 5, 5])
+        got = {}
+        for i in (4, 5, 6):
+            st, body, hdr = h.call("GET", f"/hls/{t}/seg_{i:05d}.ts")
+            self.assertEqual((st, hdr["X-Bridge-Cache"]), (200, "hit"), i)
+            got[i] = (track_spans(body), hdr.get("X-Bridge-Offset"))
+        self.assertIsNone(got[4][1])
+        self.assertIsNotNone(got[5][1])
+        self.assertEqual(got[6][1], got[5][1])
+        self.assertLess(abs(got[5][0]["video"][0] - got[4][0]["video"][1]), 0.01)
+        self.assertLess(abs(got[6][0]["video"][0] - got[5][0]["video"][1]), 0.01)
+        self.assertEqual(h.jasna.passes, [5, 0])  # nothing re-rendered
 
-    def test_seam_inside_cache_is_rejected_on_sequential_play(self):
+    def test_stale_request_does_not_overwrite_seek_state(self):
+        """An abandoned request finishing after a newer one (the viewer
+        seeked while Jasna was rendering) must not record its segment."""
         h = self.h
         _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
         t = a["token"]
-        self.seg(h, t, 5); self.seg(h, t, 6)         # pass at 5: 5 is first-of-pass (early, long)
+        sm = h.sessions
+        self.seg(h, t, 0)
+        s, old = sm.touch_segment(t)            # request for 1 starts...
+        s, new = sm.touch_segment(t)            # ...then a seek to 7 starts
+        sm.segment_served(t, 7, 33.0, ts_offset=0.0, seq=new["seq"])
+        sm.segment_served(t, 1, 9.4, ts_offset=2.0, seq=old["seq"])   # the stale one lands last
+        self.assertEqual((s.last_seg, s.last_seg_end, s.ts_offset), (7, 33.0, 0.0))
+
+    def test_repeat_of_last_segment_keeps_the_offset(self):
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        t = a["token"]
         for i in range(5):
-            self.seg(h, t, i)                        # pass at 0: 0-4
-        # Force the stale 5 to sit next to a 4 it does not meet: mark this
-        # session as if 4 had come from the cache, so the seam check applies.
+            self.seg(h, t, i)
+        self.seg(h, t, 8)
         h.call("DELETE", f"/session/{t}")
         _, b, _ = h.call("POST", "/session", {"scene_id": "1"})
         t = b["token"]
-        src4, span4 = self.seg(h, t, 4)
-        self.assertEqual(src4, "hit")
-        src5, span5 = self.seg(h, t, 5)
-        self.assertEqual(src5, "miss")                # cached 5 started 3.4s before 4 ended: rejected
-        self.assertEqual(h.cache.stats["seam_rejects"], 1)
-        self.assertEqual(h.jasna.passes, [5, 0])      # re-rendered by the pass already running past 4
-        self.assertLess(abs(span5[0] - span4[1]), 0.1)  # so this time 4 -> 5 is seamless
-        src6, span6 = self.seg(h, t, 6)
-        self.assertEqual(src6, "miss")                # and the session rides that pass on
-        self.assertLess(abs(span6[0] - span5[1]), 0.1)
-        st, health, _ = h.call("GET", "/health")
-        self.assertEqual((health["cache"]["seam_rejects"], health["cache"]["pass_bypasses"]), (1, 1))
+        self.seg(h, t, 4)
+        st, body5, hdr5 = h.call("GET", f"/hls/{t}/seg_00005.ts")     # spliced: offset
+        st, again, hdr5b = h.call("GET", f"/hls/{t}/seg_00005.ts")    # hls.js retry
+        self.assertIn("X-Bridge-Offset", hdr5)
+        self.assertEqual(hdr5b.get("X-Bridge-Offset"), hdr5["X-Bridge-Offset"])
+        self.assertEqual(track_spans(again)["video"], track_spans(body5)["video"])
+        st, body6, hdr6 = h.call("GET", f"/hls/{t}/seg_00006.ts")     # and the run continues
+        self.assertLess(abs(track_spans(body6)["video"][0] - track_spans(body5)["video"][1]), 0.01)
+
+    def test_changed_source_file_drops_its_cache(self):
+        h = self.h
+        src = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        src.write(b"v1"); src.close()
+        self.addCleanup(os.unlink, src.name)
+        key = h.cache.key(src.name, "a", ["--x", "1"])
+        h.cache.put(key, "seg_00000.ts", fake_jasna.ts_segment(0, 4))
+        h.cache.store_manifest(key, src.name, "a", ["--x", "1"], b"#EXTM3U\nseg_00000.ts\n")
+        self.assertTrue(h.cache.is_complete(key))
+        h.cache.check_source(key, src.name)                 # unchanged: kept
+        self.assertTrue(h.cache.is_complete(key))
+        with open(src.name, "wb") as fh:
+            fh.write(b"v2 is longer")
+        h.cache.check_source(key, src.name)
+        self.assertFalse(h.cache.is_complete(key))
+        self.assertIsNone(h.cache.hit(key, "seg_00000.ts"))
+        self.assertEqual(h.cache.snapshot()["source_changed"], 1)
 
     def test_seek_lands_on_cache_even_after_live_pass(self):
         h = self.h
@@ -763,6 +781,19 @@ class Managed(unittest.TestCase):
 class CustomPresets(unittest.TestCase):
     """POST /session {preset, flags}: ad-hoc presets from the plugin's setting."""
 
+    def test_custom_presets_are_pruned_oldest_first_but_never_in_use(self):
+        h = BridgeHarness()
+        try:
+            sm = h.sessions
+            sm.MAX_CUSTOM_PRESETS = 3
+            with sm.lock:
+                sm.stream_preset = "c0"           # pretend c0 is what Jasna is streaming
+                for i in range(6):
+                    sm._register_custom(config.Preset(f"c{i}", ["--x", str(i)], "custom"))
+            self.assertEqual(list(h.cfg.custom), ["c0", "c4", "c5"])
+        finally:
+            h.close()
+
     def test_validation(self):
         from jasna_bridge.config import validate_custom_preset
         p = validate_custom_preset("my hq", ["--detection-model", "rfdetr-v6-large", "--cq", "30"])
@@ -832,6 +863,12 @@ class CustomPresets(unittest.TestCase):
             self.assertEqual(cq(h.procs.command("mine")), "20")
             self.assertEqual(h.sessions.current.cache_key, h.cache.key("/media/a/one.mp4", "mine", ["--cq", "20"]))
             self.assertNotEqual(h.sessions.current.cache_key, h.cache.key("/media/a/one.mp4", "mine", ["--cq", "30"]))
+            # a second viewer sending other flags under the same name is turned
+            # away as busy and must not have re-pointed the running preset
+            st, busy, _ = h.call("POST", "/session", {"scene_id": "1", "preset": "mine", "flags": ["--cq", "99"]})
+            self.assertEqual(st, 409, busy)
+            self.assertEqual(h.cfg.preset("mine").flags, ["--cq", "20"])
+            self.assertTrue(h.procs.matches("mine"))
             h.call("DELETE", f"/session/{c['token']}")
 
             # a configured preset still works alongside, and a bare custom name

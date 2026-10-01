@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -24,7 +25,6 @@ import urllib.request
 
 log = logging.getLogger("bridge.jasna")
 
-import sys as _sys
 
 
 def jasna_license_candidates() -> list[str]:
@@ -36,12 +36,12 @@ def jasna_license_candidates() -> list[str]:
                varies with how platformdirs was called), so try both.
     First existing file wins; used for reading and for `doctor`."""
     home = os.path.expanduser("~")
-    if _sys.platform == "win32":
+    if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
         roaming = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
         dirs = [os.path.join(local, "jasna", "jasna"), os.path.join(local, "jasna"),
                 os.path.join(roaming, "jasna", "jasna"), os.path.join(roaming, "jasna")]
-    elif _sys.platform == "darwin":
+    elif sys.platform == "darwin":
         dirs = [os.path.join(home, "Library", "Application Support", "jasna"),
                 os.path.join(home, ".config", "jasna")]
     else:
@@ -123,8 +123,12 @@ class JasnaClient:
         """Open a streaming GET for a segment. Caller must close the response
         (which also closes the connection)."""
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-        conn.request("GET", "/" + name)
-        resp = conn.getresponse()
+        try:
+            conn.request("GET", "/" + name)
+            resp = conn.getresponse()
+        except BaseException:
+            conn.close()
+            raise
         resp._bridge_conn = conn  # keep the connection alive with the response
         return resp
 
@@ -154,12 +158,16 @@ class ProcessManager:
     def alive(self) -> bool:
         if not self.managed:
             return self.client.status() is not None
-        with self._lock:
-            return self.proc is not None and self.proc.poll() is None
+        # No lock: _start() holds it for the whole startup (up to
+        # start_timeout_s plus prewarm), and the reaper asks this while holding
+        # the session lock, which used to freeze every heartbeat behind a cold
+        # start. Reading one reference is atomic; poll() is safe concurrently.
+        proc = self.proc
+        return proc is not None and proc.poll() is None
 
     def pid(self) -> int | None:
-        with self._lock:
-            return self.proc.pid if self.proc and self.proc.poll() is None else None
+        proc = self.proc  # no lock, see alive()
+        return proc.pid if proc is not None and proc.poll() is None else None
 
     def matches(self, preset: str) -> bool:
         """True if the running process was started for `preset` with the flags

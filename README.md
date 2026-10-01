@@ -15,9 +15,10 @@ Bridge  (this, 127.0.0.1:8770 or LAN)     owns sessions, policy, the process
 Jasna --stream --no-browser --stream-port 8765 [preset flags]
 ```
 
-Status: Phase A of the bridge plan (foundation) — everything the PoC did,
-plus no trampling between viewers and no orphaned streams. Phases B–D
-(reverse-proxy deployment, segment cache, preset picker) build on this.
+Status: all four phases of the bridge plan are in: sessions and process
+supervision (A), reverse-proxy deployment (B), the segment cache (C) and
+preset selection with custom presets (D), plus splicing of Jasna's render
+passes into one continuous timeline.
 
 ## Install
 
@@ -37,7 +38,7 @@ The Jasna license is read from Jasna's own store, so no key goes in
 macOS `~/Library/Application Support/jasna`; `jasna.license_file` overrides). Then:
 
 ```sh
-python3 -m jasna_bridge doctor      # pass/fail check of the whole path
+python3 -m jasna_bridge doctor      # pass/fail check of the whole path; exits 1 on a failure
 ```
 
 Reverse-proxy snippets (NPM, nginx, Caddy, Cloudflare Tunnel):
@@ -97,7 +98,9 @@ optional `[[paths.map]]` rewrites.
   (`cached: true` in the `/session` reply, `from_cache` in the snapshot)
   without opening Jasna at all. A miss on such a session (eviction made a
   hole) opens Jasna on demand for that file. `/health` reports the cache
-  under `cache`.
+  under `cache`. Each stream's `meta.json` records the source file's size
+  and mtime; if the file at that path changes (re-encoded, replaced) its
+  cached segments are dropped at the next session (`source_changed`).
 - **Seams.** Jasna's segments do not sit on its playlist's fixed 4s grid
   (measured on 0.10.0): segment files are cut every 120 frames and at scene
   changes, so which source range lands under `seg_NNNNN.ts` drifts by
@@ -112,13 +115,13 @@ optional `[[paths.map]]` rewrites.
   nothing re-encoded) so the player sees one continuous timeline, the new
   pass's lead-in audio is trimmed, and the shift is kept for the rest of
   the run (`X-Bridge-Offset`, `seams_restamped` in the session stats).
-  The viewer sees the overlapped seconds once more, in sync, instead of a
-  desync; the player clock then runs ahead of file time by that much until
-  the next seek. The cache keeps Jasna's original bytes. On sequential
-  playback a cached segment that does not meet the previous one is first
-  re-requested from Jasna, which may be able to continue its pass
-  seamlessly (`seam_rejects`); once a session is being fed by Jasna's live
-  pass it stays on it (`pass_bypasses`). A seek still lands on the cache.
+  At an overlap the viewer sees those seconds once more, in sync, instead
+  of a desync; at a gap a few seconds are skipped instead of stalling; the player clock then runs ahead of file time by that much until
+  the next seek. The cache keeps Jasna's original bytes and is always
+  served first: a join between two cached passes is spliced like any
+  other, rather than re-rendered (which would cancel Jasna's current pass
+  and make a new seam). An hls.js retry of the segment it just got keeps
+  the current shift. A seek is placed by real PTS, so it resets the shift.
 - **Stall recovery.** Two failures are watched for. If Jasna stops
   answering `/status` at all (a wedged HTTP server), the reaper restarts it
   after two missed probes. If `/status` still answers but the render pass

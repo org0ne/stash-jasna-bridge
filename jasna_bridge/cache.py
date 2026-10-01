@@ -13,9 +13,10 @@ segmentation keeps segment indices stable, so (key, segment name) is safe.
 - Eviction is LRU by total bytes; evicting from a complete stream makes it
   incomplete again.
 - Each segment's real PTS span (mpegts.segment_span) is remembered so the
-  server can refuse to serve a cached segment that does not line up with the
-  one it served just before: Jasna's passes disagree about where segment N
-  starts by seconds, and a cache that mixes passes replays the seam forever.
+  server can splice segments from different Jasna passes (which disagree
+  about where segment N starts by seconds) into one timeline.
+- meta.json records the source file's size and mtime; a changed file at the
+  same path drops its cached segments.
 """
 from __future__ import annotations
 
@@ -56,8 +57,7 @@ class SegmentCache:
         self.spans: dict[tuple[str, str], tuple[float, float] | None] = {}  # (key, seg) -> PTS span, parsed lazily
         self.total = 0
         self.stats = {"hits": 0, "misses": 0, "stored": 0, "evictions": 0, "bytes_from_cache": 0,
-                      "seam_rejects": 0,   # cached copy skipped: not continuous with the segment served before it
-                      "pass_bypasses": 0}  # cached copy skipped: session is riding Jasna's live pass
+                      "source_changed": 0}
         os.makedirs(self.dir, exist_ok=True)
         self._scan()
         log.info("segment cache at %s: %d segments, %.2f GB of %.2f GB, jasna version %s",
@@ -116,8 +116,49 @@ class SegmentCache:
                 return
             meta.update({"path": path, "preset": preset, "flags": list(flags), "version": self.version,
                          "playlist": text, "segments": n, "stored_at": time.time()})
+            if "source" not in meta:
+                sig = self._source_sig(path)
+                if sig is not None:
+                    meta["source"] = sig
             self.metas[key] = meta
             self._refresh_complete(key, persist=True)
+
+    @staticmethod
+    def _source_sig(path: str) -> list | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None  # not visible from the bridge host: cannot check
+        return [st.st_size, int(st.st_mtime)]
+
+    def check_source(self, key: str, path: str) -> None:
+        """Drop a stream's cached segments if its source file changed (same
+        path, different size or mtime: re-encoded or replaced)."""
+        sig = self._source_sig(path)
+        if sig is None:
+            return
+        with self.lock:
+            meta = self.metas.get(key)
+            if meta is None:
+                return
+            old = meta.get("source")
+            if old is None:
+                meta["source"] = sig
+                self._write_meta(key)
+                return
+            if old == sig:
+                return
+            log.info("source %s changed since it was cached; dropping %d segments", path,
+                     len(self.segs.get(key, ())))
+            self.stats["source_changed"] += 1
+            for seg in list(self.segs.get(key, ())):
+                try:
+                    os.unlink(self.file_path(key, seg))
+                except OSError:
+                    pass
+                self._forget(key, seg)
+            self.metas.pop(key, None)
+            shutil.rmtree(self._key_dir(key), ignore_errors=True)
 
     def is_complete(self, key: str) -> bool:
         with self.lock:
@@ -163,22 +204,21 @@ class SegmentCache:
             self.stats["bytes_from_cache"] += entry[0]
             return fn
 
-    def has(self, key: str, seg: str) -> bool:
-        with self.lock:
-            return (key, seg) in self.entries
-
-    def span(self, key: str, seg: str) -> tuple[float, float] | None:
-        """(start, end) seconds of a cached segment's video, parsed once."""
+    def span(self, key: str, seg: str, data: bytes | None = None) -> tuple[float, float] | None:
+        """(start, end) seconds of a cached segment's video, parsed once.
+        Pass the bytes when already read, to avoid reading the file again."""
         with self.lock:
             if (key, seg) in self.spans:
                 return self.spans[(key, seg)]
             if (key, seg) not in self.entries:
                 return None
-        try:
-            with open(self.file_path(key, seg), "rb") as fh:
-                span = segment_span(fh.read())
-        except OSError:
-            span = None
+        if data is None:
+            try:
+                with open(self.file_path(key, seg), "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return None
+        span = segment_span(data)
         with self.lock:
             self.spans[(key, seg)] = span
         return span

@@ -66,8 +66,22 @@ def _lan_ip() -> str:
         return "127.0.0.1"
 
 
+def _toml_str(x) -> str:
+    """A TOML basic string: backslashes, quotes and control characters escaped
+    (a Windows binary path or a quote in a description used to break the file)."""
+    out = []
+    for c in str(x):
+        if c in ('"', "\\"):
+            out.append("\\" + c)
+        elif ord(c) < 32 or ord(c) == 127:
+            out.append(f"\\u{ord(c):04x}")
+        else:
+            out.append(c)
+    return '"' + "".join(out) + '"'
+
+
 def _toml_list(xs) -> str:
-    return "[" + ", ".join('"' + str(x).replace('"', '\\"') + '"' for x in xs) + "]"
+    return "[" + ", ".join(_toml_str(x) for x in xs) + "]"
 
 
 def _write_config(path: str, stash_url: str, binary: str, port: int, presets: dict, default_preset: str) -> None:
@@ -81,18 +95,18 @@ def _write_config(path: str, stash_url: str, binary: str, port: int, presets: di
         'path_prefix = "/jasna"',
         "",
         "[stash]",
-        f'url = "{stash_url}"',
+        f"url = {_toml_str(stash_url)}",
         "",
         "[jasna]",
         f'url = "http://127.0.0.1:{port}"',
         "manage_process = true",
-        f'binary = "{binary}"',
+        f"binary = {_toml_str(binary)}",
         f"stream_port = {port}",
-        f'default_preset = "{default_preset}"',
+        f"default_preset = {_toml_str(default_preset)}",
         "",
     ]
     for name, p in presets.items():
-        lines += [f"[presets.{name}]", f'description = "{p["description"]}"',
+        lines += [f"[presets.{_toml_str(name)}]", f"description = {_toml_str(p['description'])}",
                   f"flags = {_toml_list(p['flags'])}", ""]
     lines += [
         "[auth]",
@@ -195,13 +209,20 @@ def install(args) -> int:
     return 0
 
 
+_FAILURES: list[str] = []
+
+
 def _check(label, ok, detail=""):
     mark = "OK  " if ok else "FAIL"
     print(f"  [{mark}] {label}" + (f" - {detail}" if detail else ""))
+    if not ok:
+        _FAILURES.append(label)
     return ok
 
 
 def doctor(args) -> int:
+    """Exit 0 if every check passed, 1 otherwise (a missing license only warns)."""
+    _FAILURES.clear()
     print("stash-jasna-bridge doctor\n")
     cfg_path = args.config
     if not os.path.exists(cfg_path):
@@ -216,9 +237,8 @@ def doctor(args) -> int:
     _check(f"config {cfg_path}", True)
     _check(f"Python {sys.version.split()[0]} (need 3.11+)", sys.version_info >= (3, 11))
 
-    ok = True
     if cfg.manage_process:
-        ok &= _check(f"Jasna binary {cfg.jasna_binary}",
+        _check(f"Jasna binary {cfg.jasna_binary}",
                      bool(cfg.jasna_binary) and os.path.isfile(cfg.jasna_binary) and os.access(cfg.jasna_binary, os.X_OK))
         from .jasna import jasna_license_candidates
         lic_paths = [os.path.expanduser(cfg.jasna_license_file)] if cfg.jasna_license_file else jasna_license_candidates()
@@ -235,8 +255,8 @@ def doctor(args) -> int:
             _check(f"Jasna license {lic_found[0]}", lic_found[1],
                    "unet-4x enabled" if lic_found[1] else "no key: unet-4x disabled")
         else:
-            _check("Jasna license", False,
-                   f"not found (looked in {', '.join(lic_paths)}); unet-4x disabled, hq still works")
+            print(f"  [WARN] Jasna license - not found (looked in {', '.join(lic_paths)}); "
+                  "unet-4x disabled, hq still works")
         free = _port_free(cfg.jasna_stream_port)
         running = subprocess.run(["pgrep", "-f", f"stream-port {cfg.jasna_stream_port}"],
                                  stdout=subprocess.DEVNULL).returncode == 0 if shutil.which("pgrep") else False
@@ -257,11 +277,19 @@ def doctor(args) -> int:
     # Stash reachable + a sample media path visible from here (after path mapping)
     try:
         body = json.dumps({"query": "{ findScenes(filter:{per_page:1}){ scenes { files { path } } } }"}).encode()
-        req = urllib.request.Request(cfg.stash_url + "/graphql", data=body,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+        headers = {"Content-Type": "application/json"}
+        if cfg.stash_api_key:
+            headers["ApiKey"] = cfg.stash_api_key
+        req = urllib.request.Request(cfg.stash_url + "/graphql", data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode()).get("data") or {}
-        _check(f"Stash GraphQL {cfg.stash_url}", True)
+            payload = json.loads(resp.read().decode())
+        data = payload.get("data") or {}
+        if payload.get("errors"):
+            msg = payload["errors"][0].get("message", "GraphQL error")
+            _check(f"Stash GraphQL {cfg.stash_url}", False,
+                   f"{msg} (set stash.api_key if Stash has authentication on)")
+        else:
+            _check(f"Stash GraphQL {cfg.stash_url}", True)
         scenes = (data.get("findScenes") or {}).get("scenes") or []
         if scenes and scenes[0].get("files"):
             stash_path = scenes[0]["files"][0]["path"]
@@ -282,11 +310,18 @@ def doctor(args) -> int:
     except OSError as err:
         _check(f"cache dir {cache_dir}", False, str(err))
 
-    # Is the bridge itself answering?
+    # Is the bridge itself answering? Ask on the address it listens on.
+    host = "127.0.0.1" if cfg.host in ("", "0.0.0.0", "::") else cfg.host
+    host = f"[{host}]" if ":" in host else host
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{cfg.port}{cfg.path_prefix}/health", timeout=5) as resp:
+        with urllib.request.urlopen(f"http://{host}:{cfg.port}{cfg.path_prefix}/health", timeout=5) as resp:
             json.loads(resp.read().decode())
-        _check(f"bridge answering on :{cfg.port}{cfg.path_prefix}", True)
+        _check(f"bridge answering on {host}:{cfg.port}{cfg.path_prefix}", True)
     except (urllib.error.URLError, OSError, ValueError):
-        _check(f"bridge answering on :{cfg.port}", False, "not running? start the unit: systemctl --user start stash-jasna-bridge")
+        _check(f"bridge answering on {host}:{cfg.port}", False,
+               "not running? start the unit: systemctl --user start stash-jasna-bridge")
+    if _FAILURES:
+        print(f"\n{len(_FAILURES)} check(s) failed.")
+        return 1
+    print("\nAll checks passed.")
     return 0

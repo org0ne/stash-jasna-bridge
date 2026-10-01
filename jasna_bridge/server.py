@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -228,9 +229,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(HTTPStatus.BAD_REQUEST,
                                   f"custom preset {preset!r} collides with a configured preset; rename it")
             custom = validate_custom_preset(preset, body["flags"])
-            b.cfg.custom[custom.name] = custom
             preset = custom.name
-        if not b.cfg.has_preset(preset):
+        else:
+            custom = None
+        if custom is None and not b.cfg.has_preset(preset):
             return self.error(HTTPStatus.BAD_REQUEST, f"unknown preset {preset!r}")
         if b.cfg.manage_process is False and preset != b.cfg.default_preset:
             return self.error(HTTPStatus.BAD_REQUEST, "preset switching needs jasna.manage_process = true")
@@ -243,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
         path = b.map_path(stash_path)
         t0 = time.monotonic()
         try:
-            session, info = b.sessions.create(scene_id, path, preset, time_s, self.client_ip(), force=force)
+            session, info = b.sessions.create(scene_id, path, preset, time_s, self.client_ip(), force=force,
+                                              custom=custom)
         except Busy as busy:
             return self.send_json(HTTPStatus.CONFLICT, {"error": "busy", **busy.payload})
         except JasnaError as err:
@@ -304,41 +307,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_segment(self, token: str, seg: str):
         b = self.bridge
-        s = b.sessions.touch_segment(token)
+        s, st = b.sessions.touch_segment(token)
         index = int(seg[4:9])
         key = s.cache_key if b.cache else ""
-        sequential = s.last_seg == index - 1
-        body, source, span = None, "", None
+        body, span = None, None
         if key:
-            if sequential and s.last_seg_source == "jasna":
-                # Riding Jasna's live pass: its next segment is already rendered
-                # and guaranteed to line up; a cached copy from some earlier
-                # pass may not be. Stay on the pass (and refresh the cache).
-                if b.cache.has(key, seg):
-                    b.cache.stats["pass_bypasses"] += 1
-            else:
-                fn = b.cache.hit(key, seg)
-                if fn and sequential and s.last_seg_source == "cache" and s.last_seg_end is not None:
-                    span = b.cache.span(key, seg)
-                    if span is not None and abs(span[0] + s.ts_offset - s.last_seg_end) > self.SEAM_TOLERANCE_S:
-                        # Cached from a different pass than the segment before it.
-                        # Jasna may be able to continue that pass seamlessly
-                        # (if it has rendered on past it); ask it rather than
-                        # splice. If what comes back is off too, it is spliced below.
-                        log.info("session %s: cached %s starts at %.2fs but %s ended at %.2fs; "
-                                 "asking Jasna", token[:8], seg, span[0] + s.ts_offset, f"seg_{index - 1:05d}",
-                                 s.last_seg_end)
-                        b.cache.stats["seam_rejects"] += 1
-                        fn = None
-                if fn:
-                    try:
-                        with open(fn, "rb") as fh:
-                            body = fh.read()
-                    except OSError:
-                        body = None
-                    if body:
-                        source, span = "cache", b.cache.span(key, seg)
-            if body is None and s.lazy:
+            fn = b.cache.hit(key, seg)
+            if fn:
+                try:
+                    with open(fn, "rb") as fh:
+                        body = fh.read() or None
+                except OSError:
+                    body = None
+            if body is not None:
+                span = b.cache.span(key, seg, body)
+                source = "cache"
+            elif s.lazy:
                 try:
                     b.sessions.ensure_stream(token)
                 except JasnaError as err:
@@ -353,24 +337,26 @@ class Handler(BaseHTTPRequestHandler):
                     upstream.read()
                     return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
                 # Whole segment in memory (a few MB): the cache write is atomic,
-                # the client never sees a partial file, and the splice below
-                # needs the bytes anyway.
+                # the client never sees a partial file, and the splice needs it.
                 body = upstream.read()
             finally:
                 upstream.close()
             source = "jasna"
             span = b.cache.put(key, seg, body) if key else segment_span(body)
-        # Splice: a sequential segment must continue the timeline the player
-        # has. Jasna's PTS are honest source time, so a segment from another
-        # pass overlaps or gaps the previous one by the drift between passes;
-        # hls.js mangles video against audio at such a join when the fragment
-        # is contiguous. Shift this (and the rest of the run) to line up.
-        offset = s.ts_offset if sequential else 0.0
-        seam = None
-        end = None
+        # Splice. Jasna's PTS are honest source time, but segments from
+        # different render passes (or a cache holding several) overlap or gap
+        # by the drift between passes, and hls.js mangles video against audio
+        # at such a join when the fragment is contiguous. A sequential segment
+        # is shifted to continue the player's timeline, and the shift is kept
+        # for the rest of the run. A repeat of the last segment (hls.js retry)
+        # gets the same shift; any other request is a seek, placed by real PTS.
+        sequential = st["last_seg"] == index - 1
+        repeat = st["last_seg"] == index
+        offset = st["ts_offset"] if (sequential or repeat) else 0.0
+        seam = end = None
         if span is not None:
-            if sequential and s.last_seg_end is not None:
-                gap = s.last_seg_end - (span[0] + offset)
+            if sequential and st["last_seg_end"] is not None:
+                gap = st["last_seg_end"] - (span[0] + offset)
                 if abs(gap) > self.SEAM_TOLERANCE_S:
                     seam = gap
                     offset += gap
@@ -378,7 +364,11 @@ class Handler(BaseHTTPRequestHandler):
             if offset:
                 body = restamp(body, offset)
             end = span[1] + offset
-        b.sessions.segment_served(token, index, end, source, ts_offset=offset, seam=seam)
+        if repeat:
+            # Already recorded; only keep the stall clock alive.
+            b.sessions.segment_served(token, seq=st["seq"])
+        else:
+            b.sessions.segment_served(token, index, end, ts_offset=offset, seam=seam, seq=st["seq"])
         extra = {}
         if key:
             extra["X-Bridge-Cache"] = "hit" if source == "cache" else "miss"
@@ -387,11 +377,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send(HTTPStatus.OK, body, "video/mp2t", extra)
 
 
+class BridgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A browser dropping a keep-alive connection is routine, not an error:
+        # without this every one logged a 25-line traceback to the journal.
+        err = sys.exc_info()[1]
+        if isinstance(err, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError)):
+            log.debug("client %s dropped the connection: %s", client_address[0], err)
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(cfg, sessions, stash: StashClient) -> ThreadingHTTPServer:
     bridge = Bridge(cfg, sessions, stash)
     handler = type("BridgeHandler", (Handler,), {"bridge": bridge})
-    server = ThreadingHTTPServer((cfg.host, cfg.port), handler)
-    server.daemon_threads = True
+    server = BridgeServer((cfg.host, cfg.port), handler)
     server.bridge = bridge
     thread = threading.Thread(target=server.serve_forever, name="http", daemon=True)
     thread.start()

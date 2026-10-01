@@ -27,33 +27,47 @@ SEGMENT_SECONDS = 4.0
 FRAMES_PER_SEGMENT = 10
 MUX_DELAY_S = 1.4
 PASS_LEAD_S = 2.0
+AUDIO_LEAD_S = 1.0   # like Jasna, a pass's first segment has audio starting before its first video frame
 DRIFT_S = 0.004
-SEG_BYTES = 188 * FRAMES_PER_SEGMENT
+SEG_BYTES = 188 * FRAMES_PER_SEGMENT * 2  # one video and one audio packet per frame
 
 
-def _ts_packet(pid: int, payload: bytes, pusi: bool, cc: int) -> bytes:
+def _ts_packet(pid: int, payload: bytes, pusi: bool, cc: int, pcr90k: int | None = None) -> bytes:
+    """One 188-byte packet; the payload is padded with an adaptation field,
+    which also carries a PCR when given (so re-stamping has one to shift)."""
     pad = 184 - len(payload)
     hdr = bytes([0x47, (0x40 if pusi else 0) | (pid >> 8), pid & 0xFF])
+    if pcr90k is not None:
+        assert pad >= 8
+        pcr = bytes([(pcr90k >> 25) & 0xFF, (pcr90k >> 17) & 0xFF, (pcr90k >> 9) & 0xFF, (pcr90k >> 1) & 0xFF,
+                     ((pcr90k & 1) << 7) | 0x7E, 0x00])
+        af = bytes([pad - 1, 0x10]) + pcr + b"\xff" * (pad - 8)
+        return hdr + bytes([0x30 | (cc & 0xF)]) + af + payload
     if pad:
         af = bytes([pad - 1]) + (b"\x00" + b"\xff" * (pad - 2) if pad >= 2 else b"")
         return hdr + bytes([0x30 | (cc & 0xF)]) + af + payload
     return hdr + bytes([0x10 | (cc & 0xF)]) + payload
 
 
-def _pes_video(pts90k: int, body: bytes) -> bytes:
+def _pes(stream_id: int, pts90k: int, body: bytes) -> bytes:
     p = pts90k
     pts = bytes([0x21 | ((p >> 29) & 0x0E), (p >> 22) & 0xFF, 0x01 | ((p >> 14) & 0xFE), (p >> 7) & 0xFF,
                  0x01 | ((p << 1) & 0xFE)])
-    return b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + pts + body
+    return b"\x00\x00\x01" + bytes([stream_id]) + b"\x00\x00\x80\x80\x05" + pts + body
 
 
-def ts_segment(start_s: float, end_s: float, label: bytes = b"") -> bytes:
-    """A segment whose video PTS run from start_s to (just under) end_s."""
+def ts_segment(start_s: float, end_s: float, label: bytes = b"", audio_start_s: float | None = None) -> bytes:
+    """A segment whose video PTS run from start_s to (just under) end_s, with
+    an audio track over the same span (or from audio_start_s)."""
     frame = (end_s - start_s) / FRAMES_PER_SEGMENT
+    a0 = start_s if audio_start_s is None else audio_start_s
+    aframe = (end_s - a0) / FRAMES_PER_SEGMENT
     out = []
     for i in range(FRAMES_PER_SEGMENT):
         pts = int(round((start_s + i * frame) * 90000))
-        out.append(_ts_packet(0x100, _pes_video(pts, label[:150]), True, i))
+        out.append(_ts_packet(0x100, _pes(0xE0, pts, label[:150]), True, i, pcr90k=pts if i == 0 else None))
+        apts = int(round((a0 + i * aframe) * 90000))
+        out.append(_ts_packet(0x101, _pes(0xC0, apts, b"\xff\xf1" + b"\x00" * 60), True, i))
     return b"".join(out)
 
 
@@ -95,8 +109,9 @@ class FakeJasna:
                 self.passes.append(index)
             self.last_seg = index
             self.segments.append(name)
+            first = index == self.passes[-1]
             start, end = jasna_like_span(index, self.passes[-1])
-        return ts_segment(start, end, name.encode() + b":")
+        return ts_segment(start, end, name.encode() + b":", audio_start_s=max(0.0, start - AUDIO_LEAD_S) if first else None)
 
     def playlist(self) -> str:
         n = int(self.duration // SEGMENT_SECONDS) + 1

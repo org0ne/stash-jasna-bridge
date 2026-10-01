@@ -61,8 +61,13 @@ class Session:
     # request is checked against it so the player never gets two adjacent
     # segments from passes that disagree about the timeline.
     last_seg: int | None = None
-    last_seg_end: float | None = None
+    last_seg_end: float | None = None   # as the player saw it, i.e. after ts_offset
     last_seg_source: str = ""
+    # Timestamp shift applied to segments on the current sequential run so a
+    # new Jasna pass continues the previous one's timeline (see mpegts.restamp).
+    # Reset by any non-sequential request: hls.js treats that as a seek and
+    # places the fragment by its real PTS anyway.
+    ts_offset: float = 0.0
 
     def idle_seconds(self, now: float | None = None) -> float:
         return (now or time.monotonic()) - self.last_activity
@@ -101,7 +106,8 @@ class SessionManager:
         self.stream_preset: str | None = None
         self.stream_idle_since: float | None = None
         self.process_idle_since: float | None = time.monotonic()
-        self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0}
+        self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0,
+                      "seams_restamped": 0}
         self._stop = threading.Event()
         self._reaper = threading.Thread(target=self._reap_loop, name="reaper", daemon=True)
 
@@ -291,7 +297,7 @@ class SessionManager:
             return s
 
     def segment_served(self, token: str, index: int | None = None, end: float | None = None,
-                       source: str = "") -> None:
+                       source: str = "", ts_offset: float | None = None, seam: float | None = None) -> None:
         """A segment was actually delivered to the client, from cache or from
         Jasna. Keeps the pipeline-stall clock alive: a slow-but-live pass still
         serves one every few seconds, only a real stall goes quiet. Also
@@ -303,6 +309,12 @@ class SessionManager:
                 s.last_seg_served = time.monotonic()
                 if index is not None:
                     s.last_seg, s.last_seg_end, s.last_seg_source = index, end, source
+                if ts_offset is not None:
+                    s.ts_offset = ts_offset
+                if seam is not None:
+                    self.stats["seams_restamped"] += 1
+                    log.info("session %s: seg_%05d from a different pass (%+.2fs seam); timeline offset now %+.2fs",
+                             s.token[:8], index or 0, seam, s.ts_offset)
 
     def end(self, token: str) -> None:
         with self.lock:

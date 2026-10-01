@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jasna_bridge import config  # noqa: E402
 from jasna_bridge.cache import SegmentCache  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
-from jasna_bridge.mpegts import segment_span  # noqa: E402
+from jasna_bridge.mpegts import pcr_values, restamp, segment_span, track_spans, trim_leading_audio  # noqa: E402
 from jasna_bridge.server import serve  # noqa: E402
 from jasna_bridge.sessions import SessionManager  # noqa: E402
 from jasna_bridge.stash import StashClient  # noqa: E402
@@ -429,6 +429,60 @@ class Cache(unittest.TestCase):
         start, end = segment_span(fake_jasna.ts_segment(10.0, 14.0))
         self.assertAlmostEqual(start, 10.0, places=3); self.assertAlmostEqual(end, 14.0, places=3)
         self.assertEqual(segment_span(fake_jasna.ts_segment(10.0, 14.0) + b"\x47trailing junk"), (start, end))
+
+    def test_restamp_and_trim(self):
+        seg = fake_jasna.ts_segment(18.0, 25.4, b"x", audio_start_s=17.0)
+        self.assertEqual(track_spans(seg), {"video": (18.0, 25.4), "audio": (17.0, 25.4)})
+        self.assertEqual(pcr_values(seg), [18.0])
+        shifted = restamp(seg, 3.416)
+        self.assertEqual(len(shifted), len(seg))
+        sp = track_spans(shifted)
+        self.assertAlmostEqual(sp["video"][0], 21.416, places=3); self.assertAlmostEqual(sp["audio"][0], 20.416, places=3)
+        self.assertAlmostEqual(pcr_values(shifted)[0], 21.416, places=3)
+        self.assertAlmostEqual(track_spans(restamp(seg, -2.0))["video"][0], 16.0, places=3)
+        self.assertIs(restamp(seg, 0.0), seg)
+        trimmed = trim_leading_audio(seg, 18.0)
+        self.assertLess(len(trimmed), len(seg))
+        self.assertEqual(track_spans(trimmed)["video"], (18.0, 25.4))
+        self.assertGreaterEqual(track_spans(trimmed)["audio"][0], 18.0)
+        self.assertEqual(trim_leading_audio(seg, 16.0), seg)  # nothing before the cutoff
+
+    def test_seam_is_spliced_into_a_continuous_timeline(self):
+        """Cached 0-4 from a pass at 0, then 5 has to come from a new Jasna
+        pass: its first segment starts 3.4s before 4 ends and carries 1s of
+        lead-in audio. The player must see one continuous timeline."""
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        t = a["token"]
+        for i in range(5):
+            self.seg(h, t, i)
+        self.seg(h, t, 8)                                # park Jasna's pass elsewhere
+        h.call("DELETE", f"/session/{t}")
+        _, b, _ = h.call("POST", "/session", {"scene_id": "1"})
+        t = b["token"]
+        st, body4, hdr4 = h.call("GET", f"/hls/{t}/seg_00004.ts")
+        st, body5, hdr5 = h.call("GET", f"/hls/{t}/seg_00005.ts")
+        st, body6, hdr6 = h.call("GET", f"/hls/{t}/seg_00006.ts")
+        self.assertEqual((hdr4["X-Bridge-Cache"], hdr5["X-Bridge-Cache"], hdr6["X-Bridge-Cache"]), ("hit", "miss", "miss"))
+        self.assertNotIn("X-Bridge-Offset", hdr4)
+        self.assertAlmostEqual(float(hdr5["X-Bridge-Offset"]), 3.416, places=2)
+        self.assertEqual(hdr6["X-Bridge-Offset"], hdr5["X-Bridge-Offset"])  # the run keeps the offset
+        s4, s5, s6 = track_spans(body4), track_spans(body5), track_spans(body6)
+        self.assertLess(abs(s5["video"][0] - s4["video"][1]), 0.01)   # 4 -> 5 meets exactly
+        self.assertLess(abs(s6["video"][0] - s5["video"][1]), 0.01)   # 5 -> 6 too
+        self.assertGreaterEqual(s5["audio"][0], s5["video"][0] - 0.01)  # lead-in audio trimmed
+        self.assertAlmostEqual(pcr_values(body5)[0], s5["video"][0], places=3)
+        raw5 = h.cache.span(h.sessions.current.cache_key, "seg_00005.ts")
+        self.assertAlmostEqual(raw5[0], 18.0, places=3)                 # the cache keeps Jasna's bytes
+        st, snap, _ = h.call("GET", "/session")
+        self.assertEqual(snap["stats"]["seams_restamped"], 1)
+        # A seek is non-contiguous for hls.js: served as-is, offset dropped.
+        st, body2, hdr2 = h.call("GET", f"/hls/{t}/seg_00002.ts")
+        self.assertNotIn("X-Bridge-Offset", hdr2)
+        self.assertAlmostEqual(track_spans(body2)["video"][0], 9.408, places=3)
+        st, body3, hdr3 = h.call("GET", f"/hls/{t}/seg_00003.ts")
+        self.assertNotIn("X-Bridge-Offset", hdr3)              # same pass as 2: nothing to splice
+        self.assertEqual(h.jasna.passes, [0, 8, 5])
 
     def test_cached_segment_from_another_pass_is_rerendered_not_served(self):
         h = self.h

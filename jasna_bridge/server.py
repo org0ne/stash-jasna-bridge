@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import secrets
-import shutil
 import threading
 import time
 import urllib.parse
@@ -15,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import VERSION
 from .config import validate_custom_preset
 from .jasna import JasnaError
+from .mpegts import restamp, segment_span, trim_leading_audio
 from .sessions import Busy, NoSession
 from .stash import CookieValidator, StashClient, StashError
 
@@ -307,8 +307,8 @@ class Handler(BaseHTTPRequestHandler):
         s = b.sessions.touch_segment(token)
         index = int(seg[4:9])
         key = s.cache_key if b.cache else ""
-        sequential = key and s.last_seg == index - 1
-        fn = None
+        sequential = s.last_seg == index - 1
+        body, source, span = None, "", None
         if key:
             if sequential and s.last_seg_source == "jasna":
                 # Riding Jasna's live pass: its next segment is already rendered
@@ -320,61 +320,71 @@ class Handler(BaseHTTPRequestHandler):
                 fn = b.cache.hit(key, seg)
                 if fn and sequential and s.last_seg_source == "cache" and s.last_seg_end is not None:
                     span = b.cache.span(key, seg)
-                    if span is not None and abs(span[0] - s.last_seg_end) > self.SEAM_TOLERANCE_S:
-                        # Cached from a different pass than the segment before it:
-                        # hls.js would get a hole or overlap here, and would get it
-                        # again on every visit. Re-render instead.
+                    if span is not None and abs(span[0] + s.ts_offset - s.last_seg_end) > self.SEAM_TOLERANCE_S:
+                        # Cached from a different pass than the segment before it.
+                        # Jasna may be able to continue that pass seamlessly
+                        # (if it has rendered on past it); ask it rather than
+                        # splice. If what comes back is off too, it is spliced below.
                         log.info("session %s: cached %s starts at %.2fs but %s ended at %.2fs; "
-                                 "re-fetching from Jasna", token[:8], seg, span[0], f"seg_{index - 1:05d}",
+                                 "asking Jasna", token[:8], seg, span[0] + s.ts_offset, f"seg_{index - 1:05d}",
                                  s.last_seg_end)
                         b.cache.stats["seam_rejects"] += 1
                         fn = None
-        if fn:
+                if fn:
+                    try:
+                        with open(fn, "rb") as fh:
+                            body = fh.read()
+                    except OSError:
+                        body = None
+                    if body:
+                        source, span = "cache", b.cache.span(key, seg)
+            if body is None and s.lazy:
+                try:
+                    b.sessions.ensure_stream(token)
+                except JasnaError as err:
+                    return self.error(HTTPStatus.BAD_GATEWAY, str(err))
+        if body is None:
             try:
-                with open(fn, "rb") as fh:
-                    body = fh.read()
-            except OSError:
-                body = None
-            if body:
-                span = b.cache.span(key, seg)
-                b.sessions.segment_served(token, index, span[1] if span else None, "cache")
-                return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "hit"})
-        if key and s.lazy:
+                upstream = b.sessions.jasna.open_segment(seg)
+            except OSError as err:
+                return self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
             try:
-                b.sessions.ensure_stream(token)
-            except JasnaError as err:
-                return self.error(HTTPStatus.BAD_GATEWAY, str(err))
-        jasna = b.sessions.jasna
-        try:
-            upstream = jasna.open_segment(seg)
-        except OSError as err:
-            return self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
-        try:
-            if upstream.status != 200:
-                upstream.read()
-                return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
-            if key:
-                # Whole segment in memory (a few MB) so the cache write is atomic
-                # and the client never sees a partial file.
+                if upstream.status != 200:
+                    upstream.read()
+                    return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
+                # Whole segment in memory (a few MB): the cache write is atomic,
+                # the client never sees a partial file, and the splice below
+                # needs the bytes anyway.
                 body = upstream.read()
-                span = b.cache.put(key, seg, body)
-                b.sessions.segment_served(token, index, span[1] if span else None, "jasna")  # pipeline is alive
-                return self.send(HTTPStatus.OK, body, "video/mp2t", {"X-Bridge-Cache": "miss"})
-            b.sessions.segment_served(token, index, None, "jasna")  # Jasna produced it: pipeline is alive
-            length = upstream.getheader("Content-Length")
-            if length is None:
-                body = upstream.read()
-                return self.send(HTTPStatus.OK, body, "video/mp2t")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "video/mp2t")
-            self.send_header("Content-Length", length)
-            self.send_header("Cache-Control", "no-store")
-            for k, v in self.cors_headers().items():
-                self.send_header(k, v)
-            self.end_headers()
-            shutil.copyfileobj(upstream, self.wfile, 65536)
-        finally:
-            upstream.close()
+            finally:
+                upstream.close()
+            source = "jasna"
+            span = b.cache.put(key, seg, body) if key else segment_span(body)
+        # Splice: a sequential segment must continue the timeline the player
+        # has. Jasna's PTS are honest source time, so a segment from another
+        # pass overlaps or gaps the previous one by the drift between passes;
+        # hls.js mangles video against audio at such a join when the fragment
+        # is contiguous. Shift this (and the rest of the run) to line up.
+        offset = s.ts_offset if sequential else 0.0
+        seam = None
+        end = None
+        if span is not None:
+            if sequential and s.last_seg_end is not None:
+                gap = s.last_seg_end - (span[0] + offset)
+                if abs(gap) > self.SEAM_TOLERANCE_S:
+                    seam = gap
+                    offset += gap
+                    body = trim_leading_audio(body, span[0])  # its lead-in audio belongs to the other pass
+            if offset:
+                body = restamp(body, offset)
+            end = span[1] + offset
+        b.sessions.segment_served(token, index, end, source, ts_offset=offset, seam=seam)
+        extra = {}
+        if key:
+            extra["X-Bridge-Cache"] = "hit" if source == "cache" else "miss"
+        if offset:
+            extra["X-Bridge-Offset"] = f"{offset:.3f}"
+        self.send(HTTPStatus.OK, body, "video/mp2t", extra)
 
 
 def serve(cfg, sessions, stash: StashClient) -> ThreadingHTTPServer:

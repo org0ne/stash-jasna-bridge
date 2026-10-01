@@ -78,7 +78,11 @@ class Config:
     stream_linger_s: float = 120.0
     reaper_interval_s: float = 5.0
     takeover_idle_s: float = 20.0   # a forced request may pre-empt an owner not watching (paused or silent) this long
-    pipeline_stall_s: float = 45.0  # active+playing session, Jasna answering /status but no segment served this long -> restart
+    # Active+playing session, Jasna answering /status but no segment served for
+    # this long -> restart. Was 45s; a healthy pass goes quiet that long while
+    # it restores one --max-clip-size 180 clip (seen 2026-09-30), and every
+    # false restart puts a seam in the viewer's timeline.
+    pipeline_stall_s: float = 180.0
 
     # [auth]
     auth_mode: str = "none"  # none | token | stash_cookie

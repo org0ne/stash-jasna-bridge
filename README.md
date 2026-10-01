@@ -99,27 +99,37 @@ optional `[[paths.map]]` rewrites.
   hole) opens Jasna on demand for that file. `/health` reports the cache
   under `cache`.
 - **Seams.** Jasna's segments do not sit on its playlist's fixed 4s grid
-  (measured on 0.10.0): the first segment of a render pass starts seconds
-  early and runs 5-12s, later ones drift, so two passes disagree about where
-  segment N begins. Two adjacent segments from different passes give hls.js
-  a hole or an overlap there, and a cache that mixed passes replayed that
-  seam at the same timestamp on every visit (the "strobe, then a second of
-  black" loop). So the bridge reads every segment's real PTS span
-  (`jasna_bridge/mpegts.py`) and, on sequential playback, refuses a cached
-  segment that does not meet the one it just served (`seam_rejects` in the
-  cache stats: it is re-rendered and the stale copy replaced). Once a
-  session is being fed by Jasna's live pass it stays on that pass rather
-  than dipping back into the cache (`pass_bypasses`), which also converges
-  the cache on one pass. A seek still lands on the cache when it can. The
-  one seam this cannot remove is Jasna's own first-of-pass segment.
+  (measured on 0.10.0): segment files are cut every 120 frames and at scene
+  changes, so which source range lands under `seg_NNNNN.ts` drifts by
+  seconds over a pass, while the PTS inside stay honest (source time +
+  1.4s). Two adjacent segments from different render passes therefore
+  overlap or gap by a few seconds. hls.js copes with that after a seek but
+  not on a *contiguous* fragment: it shifts the overlapping video frames
+  and resets the audio, so the picture runs seconds behind the sound. The
+  bridge reads every segment's real PTS span (`jasna_bridge/mpegts.py`)
+  and splices on the fly: a sequential segment that does not meet the one
+  just served is re-stamped (PTS/DTS/PCR shifted, header bytes only, ~3ms,
+  nothing re-encoded) so the player sees one continuous timeline, the new
+  pass's lead-in audio is trimmed, and the shift is kept for the rest of
+  the run (`X-Bridge-Offset`, `seams_restamped` in the session stats).
+  The viewer sees the overlapped seconds once more, in sync, instead of a
+  desync; the player clock then runs ahead of file time by that much until
+  the next seek. The cache keeps Jasna's original bytes. On sequential
+  playback a cached segment that does not meet the previous one is first
+  re-requested from Jasna, which may be able to continue its pass
+  seamlessly (`seam_rejects`); once a session is being fed by Jasna's live
+  pass it stays on it (`pass_bypasses`). A seek still lands on the cache.
 - **Stall recovery.** Two failures are watched for. If Jasna stops
   answering `/status` at all (a wedged HTTP server), the reaper restarts it
   after two missed probes. If `/status` still answers but the render pass
   goes quiet - no segment served to an active, *playing* session for
-  `session.pipeline_stall_s` (45s) though it keeps asking - that is a
+  `session.pipeline_stall_s` (180s) though it keeps asking - that is a
   pipeline stall (seen 2026-09-09 on a long file), and the reaper restarts
   Jasna and re-opens on the same token too. A paused tab pulls no segments,
-  so it never counts as a stall.
+  so it never counts as a stall. Keep the timeout above what one
+  `--max-clip-size` clip takes to restore: a healthy pass goes quiet that
+  long mid-clip (45s fired twice on 2026-09-30), and every restart mid-pass
+  is a seam for the viewer.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next
   heartbeat gets 410 and the plugin drops back to the Stash source.

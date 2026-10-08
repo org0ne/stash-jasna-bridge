@@ -49,7 +49,8 @@ class BridgeHarness:
                       "open_timeout_s": 5, "start_timeout_s": 10, "default_preset": "a",
                       "manage_process": managed, "binary": FAKE_JASNA_BIN if managed else ""},
             "presets": {"a": {"flags": ["--x", "1"]}, "b": {"flags": ["--x", "2"]}},
-            "session": {"heartbeat_idle_s": 0.6, "stream_linger_s": 0.6, "reaper_interval_s": 0.1},
+            "session": {"heartbeat_idle_s": 0.6, "stream_linger_s": 0.6, "reaper_interval_s": 0.1,
+                        "seek_spacing_s": 0},
             "cache": {"enabled": True, "dir": tempfile.mkdtemp(prefix="bridge-cache-"), "max_gb": 1.0},
         }
         for section, values in (overrides or {}).items():
@@ -592,6 +593,41 @@ class Cache(unittest.TestCase):
         self.assertEqual(h.cache.snapshot()["bytes"], len(on_disk))
         self.assertEqual([n for n in os.listdir(os.path.dirname(fn)) if n.endswith(".tmp")], [])
 
+    def test_scrub_burst_reaches_jasna_as_one_seek(self):
+        # Every seek starts a Jasna pass and a pass start can deadlock Jasna,
+        # so positions the viewer scrubbed past are never forwarded.
+        import threading
+        self.h.close()
+        self.h = h = BridgeHarness({"session": {"seek_spacing_s": 0.5}})
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        tok = a["token"]
+        st, _, _ = h.call("GET", f"/hls/{tok}/seg_00000.ts")  # a seek: Jasna was never asked anything
+        self.assertEqual(st, 200)
+        results = {}
+
+        def get(i):
+            results[i] = h.call("GET", f"/hls/{tok}/seg_{i:05d}.ts")[0]
+
+        threads = []
+        for i in (5, 7, 9):  # scrubbing within the spacing window
+            t = threading.Thread(target=get, args=(i,)); t.start(); threads.append(t)
+            time.sleep(0.05)
+        for t in threads:
+            t.join()
+        self.assertEqual(results, {5: 503, 7: 503, 9: 200})
+        self.assertEqual(h.jasna.segments, ["seg_00000.ts", "seg_00009.ts"])
+        # sequential playback is never held back
+        t0 = time.monotonic()
+        self.assertEqual(h.call("GET", f"/hls/{tok}/seg_00010.ts")[0], 200)
+        self.assertLess(time.monotonic() - t0, 0.3)
+        # a lone seek after a quiet spell goes straight through
+        time.sleep(0.6)
+        t0 = time.monotonic()
+        self.assertEqual(h.call("GET", f"/hls/{tok}/seg_00003.ts")[0], 200)
+        self.assertLess(time.monotonic() - t0, 0.3)
+        snap = h.call("GET", "/session")[1]["stats"]
+        self.assertEqual((snap["seeks_forwarded"], snap["seeks_coalesced"]), (3, 2))
+
     def test_seek_lands_on_cache_even_after_live_pass(self):
         h = self.h
         _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
@@ -718,6 +754,37 @@ class Managed(unittest.TestCase):
             self.assertEqual(st, 200)
             st, snap, _ = h.call("GET", "/session")
             self.assertTrue(snap["active"]); self.assertEqual(snap["stats"]["opens"], 2)
+        finally:
+            h.close()
+
+    def test_wedge_during_segment_fetch_restarts_on_first_failed_probe(self):
+        import tempfile
+        import threading
+        hang = os.path.join(tempfile.mkdtemp(), "hang")
+        h = BridgeHarness({"jasna": {"common_flags": ["--hang-file", hang], "process_idle_minutes": 60},
+                           "session": {"heartbeat_idle_s": 60, "stream_linger_s": 5, "reaper_interval_s": 0.2}},
+                          managed=True)
+        try:
+            st, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+            self.assertEqual(st, 200, a)
+            pid1 = h.procs.pid()
+            with open(hang, "w") as fh:
+                fh.write(str(pid1))
+            fetch = threading.Thread(target=h.call, args=("GET", f"/hls/{a['token']}/seg_00001.ts"), daemon=True)
+            t0 = time.time()
+            fetch.start()  # a viewer now waits on the hung Jasna
+            while time.time() - t0 < 15 and h.procs.pid() in (None, pid1):
+                time.sleep(0.1)
+            self.assertNotEqual(h.procs.pid(), pid1)
+            # one 3s probe, not two: the viewer is not left waiting the extra round
+            self.assertLess(time.time() - t0, 5.5)
+            fetch.join(10)
+            deadline = time.time() + 10
+            while time.time() < deadline and not h.sessions.stream_path:
+                time.sleep(0.1)
+            self.assertEqual(h.sessions.stream_path, "/media/a/one.mp4", "stream re-opened")
+            st, _, _ = h.call("GET", f"/hls/{a['token']}/seg_00002.ts")
+            self.assertEqual(st, 200)
         finally:
             h.close()
 

@@ -54,6 +54,7 @@ heartbeat_idle_s = 90       # release the owner after this long without a heartb
 stream_linger_s = 120       # keep Jasna's stream open this long after release (warm ON/OFF/ON)
 takeover_idle_s = 20        # a forced request may pre-empt an owner that has not been watching (segment fetch or unpaused heartbeat) for this long; a paused tab counts as idle
 pipeline_stall_s = 180      # active & playing session, Jasna's /status still answers but no segment is served this long -> restart the pass and re-open (a paused tab never triggers it). Keep it above the time one --max-clip-size clip takes to restore: a restart mid-pass puts a seam in the viewer's timeline.
+seek_spacing_s = 1.5        # minimum time between seeks forwarded to Jasna: a scrub's intermediate positions are dropped (503) instead of each starting a render pass; Jasna 0.10.0 can deadlock at a pass start. A lone seek is never delayed. 0 = forward every seek.
 
 [auth]
 mode = "none"               # none | token | stash_cookie

@@ -18,6 +18,7 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from .jasna import JasnaClient, JasnaError, ProcessManager
@@ -108,7 +109,12 @@ class SessionManager:
         self.stream_idle_since: float | None = None
         self.process_idle_since: float | None = time.monotonic()
         self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0,
-                      "seams_restamped": 0}
+                      "seams_restamped": 0, "seeks_forwarded": 0, "seeks_coalesced": 0}
+        # Seek gate (see seek_gate): the segment last asked of Jasna and when
+        # the last seek was let through, plus fetches waiting on Jasna now.
+        self._jasna_last_seg: int | None = None
+        self._last_seek_at = float("-inf")
+        self._jasna_fetches = 0
         self._stop = threading.Event()
         self._reaper = threading.Thread(target=self._reap_loop, name="reaper", daemon=True)
 
@@ -342,6 +348,47 @@ class SessionManager:
                     log.info("session %s: seg_%05d from a different pass (%+.2fs seam); timeline offset now %+.2fs",
                              s.token[:8], index or 0, seam, s.ts_offset)
 
+    def seek_gate(self, token: str, seq: int, index: int) -> bool:
+        """Called before a segment is fetched from Jasna. A request that makes
+        Jasna seek (anything but the segment it was last asked for or the one
+        after) goes through at once if the last seek was seek_spacing_s ago,
+        else it waits out the spacing. If the viewer asks for another segment
+        meanwhile (scrubbing: hls.js abandoned this one) it returns False and
+        Jasna never sees it. Each seek starts a pass, and a pass start is where
+        Jasna 0.10.0 deadlocks."""
+        spacing = self.cfg.seek_spacing_s
+        while True:
+            with self.lock:
+                s = self.get(token)
+                last = self._jasna_last_seg
+                if spacing <= 0 or (last is not None and index in (last, last + 1)):
+                    self._jasna_last_seg = index
+                    return True
+                if s.seg_req_seq != seq:
+                    self.stats["seeks_coalesced"] += 1
+                    return False
+                now = time.monotonic()
+                wait = self._last_seek_at + spacing - now
+                if wait <= 0:
+                    self._last_seek_at = now
+                    self._jasna_last_seg = index
+                    self.stats["seeks_forwarded"] += 1
+                    return True
+            if self._stop.wait(min(wait, 0.05)):
+                return False
+
+    @contextmanager
+    def jasna_fetch(self):
+        """Wraps a segment fetch from Jasna; the reaper treats a /status
+        timeout while one is waiting as a hang straight away."""
+        with self.lock:
+            self._jasna_fetches += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._jasna_fetches -= 1
+
     def end(self, token: str) -> None:
         with self.lock:
             s = self.get(token)
@@ -400,6 +447,7 @@ class SessionManager:
                 self.procs.stop()
                 self.process_idle_since = None
             idle_check = (self.procs.managed and self.preparing is None and self.procs.alive())
+            fetching = self._jasna_fetches > 0
             # Pipeline stall: Jasna's HTTP server still answers /status (so the
             # liveness probe below is happy) but the render pass has stopped
             # producing segments. Seen 2026-09-09: after grinding a long file the
@@ -426,7 +474,10 @@ class SessionManager:
                 self._unresponsive = 0
             else:
                 self._unresponsive = getattr(self, "_unresponsive", 0) + 1
-                if self._unresponsive >= 2:
+                # A viewer waiting on a segment can't afford a second probe:
+                # a healthy Jasna answers /status at once even with dozens of
+                # segment requests parked (measured 2026-10-07).
+                if self._unresponsive >= 2 or fetching:
                     self._unresponsive = 0
                     self._recover_wedged()
 
@@ -441,6 +492,7 @@ class SessionManager:
                     f" and re-opening {path} for session {s.token[:8]}" if s else "")
         self.procs.stop(graceful=False)  # its graceful teardown is the broken path; kill outright
         with self.lock:
+            self._jasna_last_seg = None  # the new process starts its pass at segment 0
             self.stream_path = self.stream_preset = None
             self.stream_idle_since = None
             self.process_idle_since = None if s else time.monotonic()

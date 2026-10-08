@@ -328,19 +328,23 @@ class Handler(BaseHTTPRequestHandler):
                 except JasnaError as err:
                     return self.error(HTTPStatus.BAD_GATEWAY, str(err))
         if body is None:
-            try:
-                upstream = b.sessions.jasna.open_segment(seg)
-            except OSError as err:
-                return self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
-            try:
-                if upstream.status != 200:
-                    upstream.read()
-                    return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
-                # Whole segment in memory (a few MB): the cache write is atomic,
-                # the client never sees a partial file, and the splice needs it.
-                body = upstream.read()
-            finally:
-                upstream.close()
+            if not b.sessions.seek_gate(token, st["seq"], index):
+                # The viewer moved on while this seek waited its turn.
+                return self.error(HTTPStatus.SERVICE_UNAVAILABLE, "superseded by a newer seek")
+            with b.sessions.jasna_fetch():
+                try:
+                    upstream = b.sessions.jasna.open_segment(seg)
+                except OSError as err:
+                    return self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
+                try:
+                    if upstream.status != 200:
+                        upstream.read()
+                        return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
+                    # Whole segment in memory (a few MB): the cache write is atomic,
+                    # the client never sees a partial file, and the splice needs it.
+                    body = upstream.read()
+                finally:
+                    upstream.close()
             source = "jasna"
             span = b.cache.put(key, seg, body) if key else segment_span(body)
         # Splice. Jasna's PTS are honest source time, but segments from

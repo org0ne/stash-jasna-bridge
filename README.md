@@ -124,7 +124,9 @@ optional `[[paths.map]]` rewrites.
   the current shift. A seek is placed by real PTS, so it resets the shift.
 - **Stall recovery.** Two failures are watched for. If Jasna stops
   answering `/status` at all (a wedged HTTP server), the reaper restarts it
-  after two missed probes. If `/status` still answers but the render pass
+  after two missed probes, or after one while a segment fetch is waiting on
+  it (a healthy Jasna answers `/status` at once even with many segment
+  requests parked). If `/status` still answers but the render pass
   goes quiet - no segment served to an active, *playing* session for
   `session.pipeline_stall_s` (180s) though it keeps asking - that is a
   pipeline stall (seen 2026-09-09 on a long file), and the reaper restarts
@@ -133,6 +135,15 @@ optional `[[paths.map]]` rewrites.
   `--max-clip-size` clip takes to restore: a healthy pass goes quiet that
   long mid-clip (45s fired twice on 2026-09-30), and every restart mid-pass
   is a seam for the viewer.
+- **Seek spacing.** Every seek that reaches Jasna starts a render pass, and
+  Jasna 0.10.0 can deadlock at a pass start (reproduced 2026-10-07: bursts
+  of rapid seeks hang the whole process, `/status` included, within some
+  20-70 pass starts). A cache miss that would make Jasna seek is held until
+  `session.seek_spacing_s` (1.5s) has passed since the last one; if the
+  player asks for another segment meanwhile (it scrubbed on), the held
+  request gets 503 and Jasna never sees it. A lone seek and sequential
+  playback are not delayed. `/health` counts `seeks_forwarded` and
+  `seeks_coalesced`.
 - **Idle.** A session is released after `session.heartbeat_idle_s` (90s)
   without a heartbeat *or* a segment fetch. A released owner's next
   heartbeat gets 410 and the plugin drops back to the Stash source.

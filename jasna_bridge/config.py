@@ -72,6 +72,12 @@ class Config:
     # it restores one --max-clip-size 180 clip (seen 2026-09-30), and every
     # false restart puts a seam in the viewer's timeline.
     pipeline_stall_s: float = 180.0
+    # Minimum time between seeks forwarded to Jasna. Every seek starts a render
+    # pass and Jasna 0.10.0 can deadlock at a pass start (reproduced
+    # 2026-10-07: bursts of rapid seeks hang it within ~20-70 pass starts), so
+    # a scrub's intermediate positions are dropped rather than rendered.
+    # 0 forwards every seek at once.
+    seek_spacing_s: float = 1.5
 
     # [auth]
     auth_mode: str = "none"  # none | token | stash_cookie
@@ -195,6 +201,7 @@ def from_dict(data: dict) -> Config:
     cfg.reaper_interval_s = _get(session, "reaper_interval_s", cfg.reaper_interval_s)
     cfg.takeover_idle_s = _get(session, "takeover_idle_s", cfg.takeover_idle_s)
     cfg.pipeline_stall_s = _get(session, "pipeline_stall_s", cfg.pipeline_stall_s)
+    cfg.seek_spacing_s = _get(session, "seek_spacing_s", cfg.seek_spacing_s)
 
     auth = data.get("auth", {})
     cfg.auth_mode = _get(auth, "mode", cfg.auth_mode)

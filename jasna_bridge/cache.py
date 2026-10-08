@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 
@@ -233,31 +234,41 @@ class SegmentCache:
             log.warning("segment %s/%s is not a parseable MPEG-TS; seam checks are off for such segments", key, seg)
         kd = self._key_dir(key)
         fn = self.file_path(key, seg)
-        tmp = fn + ".tmp"
+        tmp = None
         try:
             os.makedirs(kd, exist_ok=True)
-            with open(tmp, "wb") as fh:
+            # A tmp name per writer: a scrub can put two fetches of the same
+            # segment in flight, and with one shared name the second open
+            # truncated the first's file and its rename found nothing (ENOENT).
+            fd, tmp = tempfile.mkstemp(dir=kd, prefix=seg + ".", suffix=".tmp")
+            with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-            os.replace(tmp, fn)
+            # Rename under the lock so the recorded size and span always
+            # describe the bytes that won.
+            with self.lock:
+                os.replace(tmp, fn)
+                tmp = None
+                self._record(key, seg, len(data), span)
         except OSError as err:
             log.warning("cannot cache %s/%s: %s", key, seg, err)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            return span
-        with self.lock:
-            old = self.entries.get((key, seg))
-            if old:
-                self.total -= old[0]
-            self.entries[(key, seg)] = (len(data), time.time())
-            self.spans[(key, seg)] = span
-            self.segs.setdefault(key, set()).add(seg)
-            self.total += len(data)
-            self.stats["stored"] += 1
-            self._evict()
-            self._refresh_complete(key, persist=False)
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         return span
+
+    def _record(self, key: str, seg: str, size: int, span: tuple[float, float] | None) -> None:
+        old = self.entries.get((key, seg))
+        if old:
+            self.total -= old[0]
+        self.entries[(key, seg)] = (size, time.time())
+        self.spans[(key, seg)] = span
+        self.segs.setdefault(key, set()).add(seg)
+        self.total += size
+        self.stats["stored"] += 1
+        self._evict()
+        self._refresh_complete(key, persist=False)
 
     def _forget(self, key: str, seg: str) -> None:
         self.spans.pop((key, seg), None)

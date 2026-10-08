@@ -563,6 +563,35 @@ class Cache(unittest.TestCase):
         self.assertIsNone(h.cache.hit(key, "seg_00000.ts"))
         self.assertEqual(h.cache.snapshot()["source_changed"], 1)
 
+    def test_concurrent_puts_of_one_segment(self):
+        # A scrub can fetch the same segment twice at once (from two passes, so
+        # different bytes). Seen 2026-10-06: a shared tmp name made the second
+        # rename fail with ENOENT and left size/span describing the wrong bytes.
+        import threading
+        h = self.h
+        key = h.cache.key("/x.mp4", "a", [])
+        bodies = [fake_jasna.ts_segment(0, 4 + i / 10) for i in range(8)]
+        barrier = threading.Barrier(len(bodies))
+
+        def put(body):
+            barrier.wait()
+            h.cache.put(key, "seg_00000.ts", body)
+
+        threads = [threading.Thread(target=put, args=(b,)) for b in bodies]
+        with self.assertNoLogs("bridge.cache", level="WARNING"):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        fn = h.cache.hit(key, "seg_00000.ts")
+        with open(fn, "rb") as fh:
+            on_disk = fh.read()
+        self.assertIn(on_disk, bodies)
+        self.assertEqual(h.cache.entries[(key, "seg_00000.ts")][0], len(on_disk))
+        self.assertEqual(h.cache.span(key, "seg_00000.ts"), segment_span(on_disk))
+        self.assertEqual(h.cache.snapshot()["bytes"], len(on_disk))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(fn)) if n.endswith(".tmp")], [])
+
     def test_seek_lands_on_cache_even_after_live_pass(self):
         h = self.h
         _, a, _ = h.call("POST", "/session", {"scene_id": "1"})

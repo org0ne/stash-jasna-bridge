@@ -70,6 +70,26 @@ def segment_span(data: bytes) -> tuple[float, float] | None:
     return spans.get("video") or spans.get("audio")
 
 
+# ffmpeg writes a segment through a 32 KiB I/O buffer, so until the file is
+# closed its size is a whole number of blocks; only the final flush at close
+# is shorter (a finished file is a block multiple 1 time in 32768). Jasna's
+# stream server hands a segment out as soon as the file exists, so a read at
+# the live edge (or of a file a killed ffmpeg left behind) can be short.
+# Seen 2026-10-11: cached seg_01811 was exactly 182 x 32768 bytes, 87 frames
+# of 120, and the next segment started 1.1s after it - the "hole" seams.
+FFMPEG_IO_BLOCK = 32768
+
+
+def partial_size(n: int) -> bool:
+    """True if a segment file of n bytes looks unfinished: empty, not a whole
+    number of TS packets, or exactly a whole number of ffmpeg's I/O blocks."""
+    return n <= 0 or n % PACKET != 0 or n % FFMPEG_IO_BLOCK == 0
+
+
+def looks_partial(data: bytes) -> bool:
+    return partial_size(len(data))
+
+
 def trim_leading_audio(data: bytes, before_s: float) -> bytes:
     """Drop audio PES units whose PTS is below before_s (whole TS packets, so
     nothing is re-encoded). Jasna's first segment of a pass carries up to

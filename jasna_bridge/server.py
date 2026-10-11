@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import VERSION
 from .config import validate_custom_preset
 from .jasna import JasnaError
-from .mpegts import restamp, segment_span, trim_leading_audio
+from .mpegts import looks_partial, restamp, segment_span, trim_leading_audio
 from .sessions import Busy, NoSession
 from .stash import CookieValidator, StashClient, StashError
 
@@ -305,6 +305,48 @@ class Handler(BaseHTTPRequestHandler):
     # from different Jasna passes (measured seams: 1.7-7s; same-pass joins: <0.1s).
     SEAM_TOLERANCE_S = 0.5
 
+    # Jasna serves a segment file as soon as it exists, so at the live edge of
+    # a pass the first read is often of a file ffmpeg is still writing
+    # (mpegts.partial_size). Re-read until it is whole; never serve or cache a
+    # partial one - its cut-off last frame and the hole before the next
+    # segment are what the viewer saw as strobing / a frozen picture.
+    PARTIAL_POLL_S = 0.3
+    PARTIAL_WAIT_S = 45.0
+
+    def fetch_complete(self, token: str, seq: int, seg: str) -> bytes | None:
+        """A whole segment from Jasna, in memory (a few MB: the cache write is
+        atomic and the splice needs it). On failure sends the error response
+        and returns None."""
+        b = self.bridge
+        deadline = time.monotonic() + self.PARTIAL_WAIT_S
+        rereads = 0
+        while True:
+            try:
+                upstream = b.sessions.jasna.open_segment(seg)
+            except OSError as err:
+                self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
+                return None
+            try:
+                if upstream.status != 200:
+                    upstream.read()
+                    self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
+                    return None
+                body = upstream.read()
+            finally:
+                upstream.close()
+            if not looks_partial(body):
+                if rereads:
+                    log.info("%s was still being written; complete after %d re-read(s) (%d bytes)",
+                             seg, rereads, len(body))
+                return body
+            if rereads == 0:
+                b.sessions.note_partial_read()
+            if time.monotonic() >= deadline or b.sessions.superseded(token, seq):
+                self.error(HTTPStatus.SERVICE_UNAVAILABLE, f"{seg} is still being written ({len(body)} bytes)")
+                return None
+            rereads += 1
+            time.sleep(self.PARTIAL_POLL_S)
+
     def h_segment(self, token: str, seg: str):
         b = self.bridge
         s, st = b.sessions.touch_segment(token)
@@ -332,19 +374,9 @@ class Handler(BaseHTTPRequestHandler):
                 # The viewer moved on while this seek waited its turn.
                 return self.error(HTTPStatus.SERVICE_UNAVAILABLE, "superseded by a newer seek")
             with b.sessions.jasna_fetch():
-                try:
-                    upstream = b.sessions.jasna.open_segment(seg)
-                except OSError as err:
-                    return self.error(HTTPStatus.BAD_GATEWAY, f"segment fetch failed: {err}")
-                try:
-                    if upstream.status != 200:
-                        upstream.read()
-                        return self.error(HTTPStatus.BAD_GATEWAY, f"Jasna returned HTTP {upstream.status} for {seg}")
-                    # Whole segment in memory (a few MB): the cache write is atomic,
-                    # the client never sees a partial file, and the splice needs it.
-                    body = upstream.read()
-                finally:
-                    upstream.close()
+                body = self.fetch_complete(token, st["seq"], seg)
+            if body is None:
+                return  # error response already sent
             source = "jasna"
             span = b.cache.put(key, seg, body) if key else segment_span(body)
         # Splice. Jasna's PTS are honest source time, but segments from

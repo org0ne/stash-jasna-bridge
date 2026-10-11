@@ -109,7 +109,8 @@ class SessionManager:
         self.stream_idle_since: float | None = None
         self.process_idle_since: float | None = time.monotonic()
         self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0,
-                      "seams_restamped": 0, "seeks_forwarded": 0, "seeks_coalesced": 0}
+                      "seams_restamped": 0, "seeks_forwarded": 0, "seeks_coalesced": 0,
+                      "partial_reads": 0}
         # Seek gate (see seek_gate): the segment last asked of Jasna and when
         # the last seek was let through, plus fetches waiting on Jasna now.
         self._jasna_last_seg: int | None = None
@@ -376,6 +377,17 @@ class SessionManager:
                     return True
             if self._stop.wait(min(wait, 0.05)):
                 return False
+
+    def superseded(self, token: str, seq: int) -> bool:
+        """True once a later segment request has arrived for this session, or
+        the session is gone: whoever holds `seq` is working for nobody."""
+        with self.lock:
+            s = self.current
+            return s is None or not secrets.compare_digest(s.token, token) or s.seg_req_seq != seq
+
+    def note_partial_read(self) -> None:
+        with self.lock:
+            self.stats["partial_reads"] += 1
 
     @contextmanager
     def jasna_fetch(self):

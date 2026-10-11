@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-from .mpegts import segment_span
+from .mpegts import partial_size, segment_span
 
 log = logging.getLogger("bridge.cache")
 
@@ -58,11 +58,14 @@ class SegmentCache:
         self.spans: dict[tuple[str, str], tuple[float, float] | None] = {}  # (key, seg) -> PTS span, parsed lazily
         self.total = 0
         self.stats = {"hits": 0, "misses": 0, "stored": 0, "evictions": 0, "bytes_from_cache": 0,
-                      "source_changed": 0}
+                      "source_changed": 0, "partials_dropped": 0}
         os.makedirs(self.dir, exist_ok=True)
         self._scan()
         log.info("segment cache at %s: %d segments, %.2f GB of %.2f GB, jasna version %s",
                  self.dir, len(self.entries), self.total / 1e9, self.max_bytes / 1e9, self.version)
+        if self.stats["partials_dropped"]:
+            log.warning("dropped %d cached segment(s) that were partially written files",
+                        self.stats["partials_dropped"])
 
     # ----- keys -----
     def key(self, path: str, preset: str, flags: list[str]) -> str:
@@ -96,6 +99,11 @@ class SegmentCache:
                 if not SEG_RE.match(name):
                     continue
                 st = os.stat(fn)
+                if partial_size(st.st_size):
+                    # stored by a bridge that did not yet check (mpegts.partial_size)
+                    os.unlink(fn)
+                    self.stats["partials_dropped"] += 1
+                    continue
                 self.entries[(key, name)] = (st.st_size, st.st_mtime)
                 self.segs.setdefault(key, set()).add(name)
                 self.total += st.st_size
@@ -229,6 +237,9 @@ class SegmentCache:
         if not SEG_RE.match(seg) or not data:
             return None
         span = segment_span(data)
+        if partial_size(len(data)):
+            log.warning("not caching %s/%s: %d bytes looks like an unfinished file", key, seg, len(data))
+            return span
         if span is None and not getattr(self, "_warned_unparseable", False):
             self._warned_unparseable = True
             log.warning("segment %s/%s is not a parseable MPEG-TS; seam checks are off for such segments", key, seg)

@@ -92,6 +92,11 @@ class FakeJasna:
         # render PASS behind a healthy HTTP server (the 2026-09-09 pipeline stall).
         self.stall_file = stall_file
         self.duration = duration
+        # Like Jasna at the live edge: the first GET of each segment returns a
+        # file ffmpeg has not finished (cut short of a packet boundary), the
+        # next GET the whole thing.
+        self.partial_first = False
+        self.partial_served: set[str] = set()
         self.path: str | None = None
         self.opens: list[str] = []
         self.stops = 0
@@ -166,7 +171,12 @@ def make_handler(state: FakeJasna):
                             return self.reply(503, b"segment not ready", "text/plain")
                     except OSError:
                         pass
-                return self.reply(200, state.render(self.path[1:]), "video/mp2t")
+                body = state.render(self.path[1:])
+                with state.lock:
+                    if state.partial_first and self.path[1:] not in state.partial_served:
+                        state.partial_served.add(self.path[1:])
+                        body = body[:-40]
+                return self.reply(200, body, "video/mp2t")
             self.reply(404, b"not found", "text/plain")
 
         def do_POST(self):

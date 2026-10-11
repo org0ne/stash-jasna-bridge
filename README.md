@@ -122,6 +122,17 @@ optional `[[paths.map]]` rewrites.
   other, rather than re-rendered (which would cancel Jasna's current pass
   and make a new seam). An hls.js retry of the segment it just got keeps
   the current shift. A seek is placed by real PTS, so it resets the shift.
+- **Partial segments.** Jasna's stream server hands a segment file out as
+  soon as it exists, and ffmpeg writes it through a 32 KiB buffer, so a read
+  at the live edge of a pass (or of the file a killed ffmpeg left behind) can
+  be short: a whole number of 32 KiB blocks, its last frame cut off, and a
+  hole before the next segment. That was the strobing / frozen picture seen
+  on 2026-10-06, 10-08, 10-09 and 10-11 (the bridge logged each as a -3.3s
+  "seam"). The bridge now treats a body that is empty, not a whole number of
+  TS packets, or exactly a block multiple as unfinished, re-reads it every
+  0.3s for up to 45s (503 if it never completes or the viewer seeks away),
+  never caches a partial, and drops any it finds in the cache at startup.
+  `/health` counts `partial_reads` and `cache.partials_dropped`.
 - **Stall recovery.** Two failures are watched for. If Jasna stops
   answering `/status` at all (a wedged HTTP server), the reaper restarts it
   after two missed probes, or after one while a segment fetch is waiting on

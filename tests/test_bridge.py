@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jasna_bridge import config  # noqa: E402
 from jasna_bridge.cache import SegmentCache  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
-from jasna_bridge.mpegts import pcr_values, restamp, segment_span, track_spans, trim_leading_audio  # noqa: E402
+from jasna_bridge.mpegts import (looks_partial, partial_size, pcr_values, restamp, segment_span,  # noqa: E402
+                                 track_spans, trim_leading_audio)
 from jasna_bridge.server import serve  # noqa: E402
 from jasna_bridge.sessions import SessionManager  # noqa: E402
 from jasna_bridge.stash import StashClient  # noqa: E402
@@ -627,6 +628,63 @@ class Cache(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 0.3)
         snap = h.call("GET", "/session")[1]["stats"]
         self.assertEqual((snap["seeks_forwarded"], snap["seeks_coalesced"]), (3, 2))
+
+    def test_partial_segment_is_reread_until_complete(self):
+        # Jasna serves a segment file as soon as it exists; at the live edge the
+        # first read is of a file ffmpeg is still writing (seen 2026-10-11:
+        # seg_01811 cached at 182 x 32 KiB, 87 of 120 frames). The bridge must
+        # re-read until it is whole and never cache the short one.
+        h = self.h
+        h.jasna.partial_first = True
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        tok = a["token"]
+        st, body, hdr = h.call("GET", f"/hls/{tok}/seg_00000.ts")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(body) % 188, 0)
+        self.assertFalse(looks_partial(body))
+        self.assertEqual(h.jasna.segments, ["seg_00000.ts", "seg_00000.ts"], "one re-read")
+        self.assertEqual(hdr["X-Bridge-Cache"], "miss")
+        key = h.sessions.current.cache_key
+        fn = h.cache.hit(key, "seg_00000.ts")
+        self.assertIsNotNone(fn)
+        self.assertEqual(os.path.getsize(fn), len(body))
+        self.assertEqual(h.call("GET", "/health")[1]["stats"]["partial_reads"], 1)
+        # a hit afterwards is the complete file, no Jasna
+        st, body2, hdr = h.call("GET", f"/hls/{tok}/seg_00000.ts")
+        self.assertEqual((st, hdr["X-Bridge-Cache"], len(h.jasna.segments)), (200, "hit", 2))
+
+    def test_partial_size_signature(self):
+        # ffmpeg writes through a 32 KiB buffer: an unfinished file is a whole
+        # number of blocks; a finished one is a whole number of 188-byte packets
+        # and (almost) never a block multiple.
+        self.assertTrue(partial_size(0))
+        self.assertTrue(partial_size(187))
+        self.assertTrue(partial_size(5963776))          # 182 x 32768, the real one
+        self.assertTrue(partial_size(32768 * 47))        # also 188-aligned, still a block multiple
+        self.assertFalse(partial_size(188 * 100))
+        self.assertFalse(partial_size(188 * 31730))           # 5965240: packet-aligned, not a block multiple
+        self.assertTrue(looks_partial(b""))
+        self.assertFalse(looks_partial(fake_jasna.ts_segment(0, 4)))
+
+    def test_scan_drops_cached_partials(self):
+        h = self.h
+        key = h.cache.key("/p.mp4", "a", [])
+        kd = os.path.join(h.cache.dir, key)
+        os.makedirs(kd)
+        with open(os.path.join(kd, "seg_00000.ts"), "wb") as fh:
+            fh.write(fake_jasna.ts_segment(0, 4))
+        with open(os.path.join(kd, "seg_00001.ts"), "wb") as fh:
+            fh.write(b"\x47" * 32768)                   # a file ffmpeg never closed
+        with open(os.path.join(kd, "seg_00002.ts"), "wb") as fh:
+            fh.write(b"\x47" * (188 * 10 + 40))         # cut mid-packet
+        fresh = SegmentCache(h.cfg)
+        self.assertEqual(sorted(fresh.segs[key]), ["seg_00000.ts"])
+        self.assertEqual(fresh.stats["partials_dropped"], 2)
+        self.assertEqual(sorted(os.listdir(kd)), ["seg_00000.ts"])
+        # and put() refuses one outright
+        self.assertIsNone(fresh.hit(key, "seg_00001.ts"))
+        fresh.put(key, "seg_00003.ts", b"\x47" * 32768)
+        self.assertIsNone(fresh.hit(key, "seg_00003.ts"))
 
     def test_seek_lands_on_cache_even_after_live_pass(self):
         h = self.h

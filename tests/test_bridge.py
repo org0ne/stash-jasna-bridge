@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jasna_bridge import config  # noqa: E402
 from jasna_bridge.cache import SegmentCache  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
-from jasna_bridge.mpegts import (looks_partial, partial_size, pcr_values, restamp, segment_span,  # noqa: E402
-                                 track_spans, trim_leading_audio)
+from jasna_bridge.mpegts import (JASNA_MUX_DELAY_S, looks_partial, partial_size, pcr_values, restamp,  # noqa: E402
+                                 segment_span, track_spans, trim_leading_audio)
+from jasna_bridge.playlist import retime  # noqa: E402
 from jasna_bridge.server import serve  # noqa: E402
 from jasna_bridge.sessions import SessionManager  # noqa: E402
 from jasna_bridge.stash import StashClient  # noqa: E402
@@ -385,7 +386,10 @@ class Cache(unittest.TestCase):
         self.assertEqual(st, 200, b); self.assertTrue(b["cached"])
         self.assertEqual(len(h.jasna.opens), 1)
         st, pl2, hdr = h.call("GET", b["playlist_path"])
-        self.assertEqual((st, pl2), (200, pl))
+        self.assertEqual(st, 200)
+        names = lambda p: [l for l in p.decode().splitlines() if l.endswith(".ts")]
+        self.assertEqual(names(pl2), names(pl))   # same segments; durations are re-timed to the cached video
+        self.assertIn("X-Bridge-Retimed", hdr)
         hdr = self.fetch_all(h, b["token"], n)
         self.assertEqual(hdr["X-Bridge-Cache"], "hit")
         self.assertEqual(h.jasna.segments, segs_before)
@@ -628,6 +632,78 @@ class Cache(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 0.3)
         snap = h.call("GET", "/session")[1]["stats"]
         self.assertEqual((snap["seeks_forwarded"], snap["seeks_coalesced"]), (3, 2))
+
+    def test_playlist_retime(self):
+        pl = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n"
+              + "".join(f"#EXTINF:4.000,\nseg_{i:05d}.ts\n" for i in range(5)) + "#EXT-X-ENDLIST\n")
+        # segments 1 and 2 are cached: their video really starts at 2.8s and 5.4s
+        out, moved = retime(pl, {1: 2.8 + 1.4, 2: 5.4 + 1.4}, 1.4)
+        durs = [float(l.split(":")[1].rstrip(",")) for l in out.splitlines() if l.startswith("#EXTINF")]
+        self.assertEqual(moved, 2)
+        self.assertEqual(durs, [2.8, 2.6, 6.6, 4.0, 4.0])      # 0->2.8, 2.8->5.4, 5.4->12 (nominal), 12->16, last kept
+        self.assertIn("#EXT-X-TARGETDURATION:7", out)
+        self.assertEqual(out.count("seg_0000"), 5)
+        # nothing known, or everything already on its slot: untouched
+        self.assertEqual(retime(pl, {}, 1.4), (pl, 0))
+        self.assertEqual(retime(pl, {3: 12.0 + 1.4}, 1.4), (pl, 0))
+        # a segment that starts after the next nominal slot never yields a negative duration
+        out, _ = retime(pl, {1: 9.0 + 1.4}, 1.4)
+        self.assertTrue(all(d > 0 for d in [float(l.split(":")[1].rstrip(",")) for l in out.splitlines() if l.startswith("#EXTINF")]))
+
+    def test_playlist_positions_match_cached_segments(self):
+        # hls.js pins its first fragment to the playlist position, so the
+        # playlist must put every cached segment where its video really starts.
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        tok = a["token"]
+        st, pl0, hdr = h.call("GET", f"/hls/{tok}/stream.m3u8")
+        self.assertEqual(st, 200); self.assertNotIn("X-Bridge-Retimed", hdr)
+        real = {}
+        for seg in (3, 4, 5):  # a pass from 3: its first segment starts PASS_LEAD_S early
+            st, body, _ = h.call("GET", f"/hls/{tok}/seg_{seg:05d}.ts")
+            self.assertEqual(st, 200)
+            real[seg] = track_spans(body)["video"][0] - JASNA_MUX_DELAY_S
+        self.assertAlmostEqual(real[3], 12.0 - fake_jasna.PASS_LEAD_S - JASNA_MUX_DELAY_S, places=2)  # fake's first segment has no mux delay
+        st, pl, hdr = h.call("GET", f"/hls/{tok}/stream.m3u8")
+        self.assertEqual(st, 200)
+        self.assertIn("X-Bridge-Retimed", hdr)
+        durs = [float(l.split(":")[1].rstrip(",")) for l in pl.decode().splitlines() if l.startswith("#EXTINF")]
+        pos = [0.0]
+        for d in durs:
+            pos.append(pos[-1] + d)
+        for seg in (3, 4, 5):
+            self.assertAlmostEqual(pos[seg], real[seg], places=2, msg=f"seg {seg}")
+        self.assertAlmostEqual(pos[2], 8.0, places=3)     # untouched before the cached run
+        self.assertAlmostEqual(pos[6], 24.0, places=2)    # back on the nominal grid after it
+        # the timing survives a bridge restart without re-reading the segments
+        key = h.sessions.current.cache_key
+        fresh = SegmentCache(h.cfg)
+        self.assertEqual(fresh.video_starts(key), h.cache.video_starts(key))
+        self.assertEqual(sorted(fresh.video_starts(key)), [3, 4, 5])
+
+    def test_lead_in_audio_is_dropped_from_every_pass_start(self):
+        # A pass's first segment has audio from before its first frame (the fake
+        # mimics Jasna's 1s; real passes carry 1.4-8s). hls.js anchors the
+        # session clock to the earliest sample, so left in, the picture and all
+        # subtitle cues sit that far apart for the whole session.
+        h = self.h
+        _, a, _ = h.call("POST", "/session", {"scene_id": "1"})
+        tok = a["token"]
+        for seg, note in ((3, "first request = pass start"), (4, "sequential, same pass"), (8, "a seek = new pass")):
+            st, body, hdr = h.call("GET", f"/hls/{tok}/seg_{seg:05d}.ts")
+            self.assertEqual(st, 200, note)
+            tr = track_spans(body)
+            self.assertGreaterEqual(tr["audio"][0], tr["video"][0] - 0.05, f"{note}: audio must not start before video")
+            if seg in (3, 8):
+                self.assertAlmostEqual(float(hdr["X-Bridge-Audio-Trimmed"]), fake_jasna.AUDIO_LEAD_S, delta=0.1, msg=note)
+            else:
+                self.assertNotIn("X-Bridge-Audio-Trimmed", hdr, note)
+        self.assertEqual(h.call("GET", "/health")[1]["stats"]["audio_leads_trimmed"], 2)
+        # the cache keeps Jasna's bytes; a hit is trimmed again on the way out
+        st, body, hdr = h.call("GET", f"/hls/{tok}/seg_00008.ts")
+        self.assertEqual((st, hdr["X-Bridge-Cache"]), (200, "hit"))
+        tr = track_spans(body)
+        self.assertGreaterEqual(tr["audio"][0], tr["video"][0] - 0.05)
 
     def test_partial_segment_is_reread_until_complete(self):
         # Jasna serves a segment file as soon as it exists; at the live edge the

@@ -122,6 +122,32 @@ optional `[[paths.map]]` rewrites.
   other, rather than re-rendered (which would cancel Jasna's current pass
   and make a new seam). An hls.js retry of the segment it just got keeps
   the current shift. A seek is placed by real PTS, so it resets the shift.
+- **Re-timed playlist.** Jasna's playlist calls every segment 4.000s, but
+  its segments are 120 frames (4.004s at 29.97fps) and anything from 0.5s to
+  7s at scene cuts, so within a pass the content drifts seconds away from
+  the slot its name implies (-3.5s after 85 segments, measured 2026-10-12).
+  hls.js pins the *first* fragment it loads to that fragment's playlist
+  position and places the rest by timestamp, so a session that starts on a
+  cached mid-pass segment ran the whole time with the picture that far from
+  the clock, and subtitles (keyed to the clock) with it. The bridge records
+  where every cached segment's video starts (`spans` in `meta.json`) and
+  serves the playlist with those entries moved to their real positions;
+  unknown segments stay on the nominal grid, which is where a fresh Jasna
+  pass starts them (`X-Bridge-Retimed`). A native HLS player (Safari) keeps
+  the playlist grid as its clock for segments rendered live after the
+  playlist was fetched, so there a residual drift remains until Jasna's
+  segments are regular.
+- **Lead-in audio.** The first segment of every Jasna pass starts its
+  video exactly on its 4s slot but carries 1.4-8s of audio from before that
+  (ffmpeg `-ss` with `-c:a copy` keeps audio from the preceding keyframe).
+  Players anchor the stream's clock to the earliest sample of the first
+  fragment they load, so left in, the picture ran that many seconds behind
+  the clock for the whole session: subtitles early by a different amount
+  after every toggle or seek, and a toggle landing a few seconds before where
+  it left off (measured 2026-10-12: 7.9s with hls.js 1.7.2). The bridge drops
+  audio that precedes a segment's first video frame on the way out
+  (`X-Bridge-Audio-Trimmed`, `/health` `audio_leads_trimmed`); the cache
+  keeps Jasna's original bytes.
 - **Partial segments.** Jasna's stream server hands a segment file out as
   soon as it exists, and ffmpeg writes it through a 32 KiB buffer, so a read
   at the live edge of a pass (or of the file a killed ffmpeg left behind) can

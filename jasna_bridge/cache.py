@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-from .mpegts import partial_size, segment_span
+from .mpegts import partial_size, track_spans
 
 log = logging.getLogger("bridge.cache")
 
@@ -55,7 +55,7 @@ class SegmentCache:
         self.entries: dict[tuple[str, str], tuple[int, float]] = {}  # (key, seg) -> (bytes, last_used)
         self.segs: dict[str, set[str]] = {}                            # key -> cached segment names
         self.metas: dict[str, dict] = {}                               # key -> meta.json contents
-        self.spans: dict[tuple[str, str], tuple[float, float] | None] = {}  # (key, seg) -> PTS span, parsed lazily
+        self.spans: dict[tuple[str, str], dict] = {}  # (key, seg) -> {"video": (start, end), "audio": ...}, parsed lazily
         self.total = 0
         self.stats = {"hits": 0, "misses": 0, "stored": 0, "evictions": 0, "bytes_from_cache": 0,
                       "source_changed": 0, "partials_dropped": 0}
@@ -107,6 +107,9 @@ class SegmentCache:
                 self.entries[(key, name)] = (st.st_size, st.st_mtime)
                 self.segs.setdefault(key, set()).add(name)
                 self.total += st.st_size
+                saved = (self.metas.get(key) or {}).get("spans", {}).get(name)
+                if saved:
+                    self.spans[(key, name)] = {t: tuple(v) for t, v in saved.items()}
         for key in list(self.metas):
             self._refresh_complete(key, persist=False)
 
@@ -213,34 +216,60 @@ class SegmentCache:
             self.stats["bytes_from_cache"] += entry[0]
             return fn
 
-    def span(self, key: str, seg: str, data: bytes | None = None) -> tuple[float, float] | None:
-        """(start, end) seconds of a cached segment's video, parsed once.
-        Pass the bytes when already read, to avoid reading the file again."""
+    def tracks(self, key: str, seg: str, data: bytes | None = None) -> dict:
+        """{"video": (start, end), "audio": (start, end)} seconds of a cached
+        segment, parsed once ({} if unknown or not parseable). Pass the bytes
+        when already read, to avoid reading the file again."""
         with self.lock:
             if (key, seg) in self.spans:
                 return self.spans[(key, seg)]
             if (key, seg) not in self.entries:
-                return None
+                return {}
         if data is None:
             try:
                 with open(self.file_path(key, seg), "rb") as fh:
                     data = fh.read()
             except OSError:
-                return None
-        span = segment_span(data)
+                return {}
+        tracks = track_spans(data)
         with self.lock:
-            self.spans[(key, seg)] = span
-        return span
+            self._remember_spans(key, seg, tracks)
+        return tracks
 
-    def put(self, key: str, seg: str, data: bytes) -> tuple[float, float] | None:
-        """Store a segment; returns its PTS span (None if not parseable)."""
+    def _remember_spans(self, key: str, seg: str, tracks: dict) -> None:
+        """Keep a segment's track spans in memory and in meta.json, so the
+        playlist can be re-timed (see playlist.retime) without reading
+        every segment back."""
+        self.spans[(key, seg)] = tracks
+        meta = self.metas.setdefault(key, {})
+        meta.setdefault("spans", {})[seg] = {t: list(v) for t, v in tracks.items()}
+        self._write_meta(key)
+
+    def video_starts(self, key: str) -> dict[int, float]:
+        """{segment index: PTS of its first video frame} for every cached
+        segment of a stream whose timing is known."""
+        with self.lock:
+            out = {}
+            for seg in self.segs.get(key, ()):
+                v = self.spans.get((key, seg), {}).get("video")
+                if v:
+                    out[int(seg[4:9])] = v[0]
+            return out
+
+    def span(self, key: str, seg: str, data: bytes | None = None) -> tuple[float, float] | None:
+        """(start, end) seconds of a cached segment's video (audio if none)."""
+        tracks = self.tracks(key, seg, data)
+        return tracks.get("video") or tracks.get("audio")
+
+    def put(self, key: str, seg: str, data: bytes) -> dict:
+        """Store a segment; returns its track spans (see tracks())."""
         if not SEG_RE.match(seg) or not data:
-            return None
-        span = segment_span(data)
+            return {}
+        tracks = track_spans(data)
         if partial_size(len(data)):
             log.warning("not caching %s/%s: %d bytes looks like an unfinished file", key, seg, len(data))
-            return span
-        if span is None and not getattr(self, "_warned_unparseable", False):
+            return tracks
+        if not tracks and not getattr(self, "_warned_unparseable", False):
             self._warned_unparseable = True
             log.warning("segment %s/%s is not a parseable MPEG-TS; seam checks are off for such segments", key, seg)
         kd = self._key_dir(key)
@@ -259,7 +288,7 @@ class SegmentCache:
             with self.lock:
                 os.replace(tmp, fn)
                 tmp = None
-                self._record(key, seg, len(data), span)
+                self._record(key, seg, len(data), tracks)
         except OSError as err:
             log.warning("cannot cache %s/%s: %s", key, seg, err)
             if tmp:
@@ -267,15 +296,15 @@ class SegmentCache:
                     os.unlink(tmp)
                 except OSError:
                     pass
-        return span
+        return tracks
 
-    def _record(self, key: str, seg: str, size: int, span: tuple[float, float] | None) -> None:
+    def _record(self, key: str, seg: str, size: int, tracks: dict) -> None:
         old = self.entries.get((key, seg))
         if old:
             self.total -= old[0]
         self.entries[(key, seg)] = (size, time.time())
-        self.spans[(key, seg)] = span
         self.segs.setdefault(key, set()).add(seg)
+        self._remember_spans(key, seg, tracks)
         self.total += size
         self.stats["stored"] += 1
         self._evict()
@@ -283,6 +312,7 @@ class SegmentCache:
 
     def _forget(self, key: str, seg: str) -> None:
         self.spans.pop((key, seg), None)
+        (self.metas.get(key) or {}).get("spans", {}).pop(seg, None)
         entry = self.entries.pop((key, seg), None)
         if entry:
             self.total -= entry[0]

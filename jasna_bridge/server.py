@@ -15,7 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import VERSION
 from .config import validate_custom_preset
 from .jasna import JasnaError
-from .mpegts import looks_partial, restamp, segment_span, trim_leading_audio
+from .mpegts import JASNA_MUX_DELAY_S, looks_partial, restamp, track_spans, trim_leading_audio
+from .playlist import retime
 from .sessions import Busy, NoSession
 from .stash import CookieValidator, StashClient, StashError
 
@@ -287,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
         if b.cache and s.cache_key:
             data = b.cache.manifest(s.cache_key)
             if data is not None:
-                return self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
+                return self.send_playlist(s, data)
         data = b.sessions.jasna.playlist()
         if data is None and s.lazy:
             try:
@@ -299,11 +300,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(HTTPStatus.BAD_GATEWAY, "Jasna has no stream open")
         if b.cache and s.cache_key:
             b.cache.store_manifest(s.cache_key, s.path, s.preset, b.cfg.preset(s.preset).flags, data)
-        self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl")
+        self.send_playlist(s, data)
+
+    def send_playlist(self, s, data: bytes) -> None:
+        """Jasna's playlist with every cached segment's entry moved to where
+        its video really starts (playlist.retime): hls.js pins the first
+        fragment it loads to its playlist position, so a session that begins
+        on a cached mid-pass segment would otherwise keep the picture seconds
+        away from the clock - and subtitles with it."""
+        b = self.bridge
+        extra = {}
+        if b.cache and s.cache_key:
+            starts = b.cache.video_starts(s.cache_key)
+            if starts:
+                text, moved = retime(data.decode(errors="replace"), starts, JASNA_MUX_DELAY_S)
+                if moved:
+                    data = text.encode()
+                    extra["X-Bridge-Retimed"] = str(moved)
+        self.send(HTTPStatus.OK, data, "application/vnd.apple.mpegurl", extra)
 
     # Adjacent segments whose video does not meet within this many seconds are
     # from different Jasna passes (measured seams: 1.7-7s; same-pass joins: <0.1s).
     SEAM_TOLERANCE_S = 0.5
+    # Within a pass audio leads video by one AAC frame at most (<= 25ms).
+    AUDIO_LEAD_TOLERANCE_S = 0.1
 
     # Jasna serves a segment file as soon as it exists, so at the live edge of
     # a pass the first read is often of a file ffmpeg is still writing
@@ -352,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
         s, st = b.sessions.touch_segment(token)
         index = int(seg[4:9])
         key = s.cache_key if b.cache else ""
-        body, span = None, None
+        body, tracks = None, {}
         if key:
             fn = b.cache.hit(key, seg)
             if fn:
@@ -362,7 +382,7 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     body = None
             if body is not None:
-                span = b.cache.span(key, seg, body)
+                tracks = b.cache.tracks(key, seg, body)
                 source = "cache"
             elif s.lazy:
                 try:
@@ -378,7 +398,21 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 return  # error response already sent
             source = "jasna"
-            span = b.cache.put(key, seg, body) if key else segment_span(body)
+            tracks = b.cache.put(key, seg, body) if key else track_spans(body)
+        span = tracks.get("video") or tracks.get("audio")
+        # The first segment of a Jasna pass carries 1.4-8s of audio from before
+        # its first video frame (ffmpeg -ss with -c:a copy keeps audio from the
+        # preceding keyframe on). Players anchor the stream's clock to the
+        # earliest sample of the first fragment they load (measured 2026-10-12
+        # with hls.js 1.7.2: video landed 7.9s late in media time), which put
+        # subtitles and every later toggle/seek that many seconds off for the
+        # whole session. Drop it, so the clock starts at the picture.
+        audio = tracks.get("audio")
+        lead = span[0] - audio[0] if span and audio and "video" in tracks else 0.0
+        if lead > self.AUDIO_LEAD_TOLERANCE_S:
+            body = trim_leading_audio(body, span[0])
+            b.sessions.note_audio_trimmed()
+            log.info("session %s: %s carried %.2fs of audio before its first frame; dropped", s.token[:8], seg, lead)
         # Splice. Jasna's PTS are honest source time, but segments from
         # different render passes (or a cache holding several) overlap or gap
         # by the drift between passes, and hls.js mangles video against audio
@@ -396,7 +430,6 @@ class Handler(BaseHTTPRequestHandler):
                 if abs(gap) > self.SEAM_TOLERANCE_S:
                     seam = gap
                     offset += gap
-                    body = trim_leading_audio(body, span[0])  # its lead-in audio belongs to the other pass
             if offset:
                 body = restamp(body, offset)
             end = span[1] + offset
@@ -410,6 +443,8 @@ class Handler(BaseHTTPRequestHandler):
             extra["X-Bridge-Cache"] = "hit" if source == "cache" else "miss"
         if offset:
             extra["X-Bridge-Offset"] = f"{offset:.3f}"
+        if lead > self.AUDIO_LEAD_TOLERANCE_S:
+            extra["X-Bridge-Audio-Trimmed"] = f"{lead:.3f}"
         self.send(HTTPStatus.OK, body, "video/mp2t", extra)
 
 

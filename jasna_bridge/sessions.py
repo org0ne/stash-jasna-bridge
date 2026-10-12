@@ -110,7 +110,7 @@ class SessionManager:
         self.process_idle_since: float | None = time.monotonic()
         self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0,
                       "seams_restamped": 0, "seeks_forwarded": 0, "seeks_coalesced": 0,
-                      "partial_reads": 0}
+                      "partial_reads": 0, "audio_leads_trimmed": 0}
         # Seek gate (see seek_gate): the segment last asked of Jasna and when
         # the last seek was let through, plus fetches waiting on Jasna now.
         self._jasna_last_seg: int | None = None
@@ -388,6 +388,10 @@ class SessionManager:
     def note_partial_read(self) -> None:
         with self.lock:
             self.stats["partial_reads"] += 1
+
+    def note_audio_trimmed(self) -> None:
+        with self.lock:
+            self.stats["audio_leads_trimmed"] += 1
 
     @contextmanager
     def jasna_fetch(self):

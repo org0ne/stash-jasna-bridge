@@ -70,6 +70,11 @@ def segment_span(data: bytes) -> tuple[float, float] | None:
     return spans.get("video") or spans.get("audio")
 
 
+# Jasna's segments carry PTS = source time + 1.4s (ffmpeg's mpegts muxer
+# delay). Frame-matched against the source 2026-10-12: the first frame of a
+# segment sits at (PTS - 1.4) in the file to within one frame.
+JASNA_MUX_DELAY_S = 1.4
+
 # ffmpeg writes a segment through a 32 KiB I/O buffer, so until the file is
 # closed its size is a whole number of blocks; only the final flush at close
 # is shorter (a finished file is a block multiple 1 time in 32768). Jasna's

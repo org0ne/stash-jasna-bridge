@@ -100,6 +100,9 @@ class FakeJasna:
         self.path: str | None = None
         self.opens: list[str] = []
         self.stops = 0
+        self.epoch_urls = False   # playlist entries carry ?epoch=N like Jasna 0.11
+        self.epoch = 0            # bumped on every /open
+        self.delete_only = False  # 0.11 dialect: POST /stop 404s, DELETE /open closes
         self.segments: list[str] = []
         self.passes: list[int] = []     # segment index each render pass started at
         self.last_seg: int | None = None
@@ -122,8 +125,9 @@ class FakeJasna:
         n = int(self.duration // SEGMENT_SECONDS) + 1
         lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{int(SEGMENT_SECONDS)}",
                  "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MEDIA-SEQUENCE:0"]
+        suffix = f"?epoch={self.epoch}" if self.epoch_urls else ""  # Jasna 0.11 style entries
         for i in range(n):
-            lines += [f"#EXTINF:{SEGMENT_SECONDS:.6f},", f"seg_{i:05d}.ts"]
+            lines += [f"#EXTINF:{SEGMENT_SECONDS:.6f},", f"seg_{i:05d}.ts{suffix}"]
         lines.append("#EXT-X-ENDLIST")
         return "\n".join(lines) + "\n"
 
@@ -161,9 +165,16 @@ def make_handler(state: FakeJasna):
                 if state.path is None:
                     return self.reply(404, b"no stream", "text/plain")
                 return self.reply(200, state.playlist().encode(), "application/vnd.apple.mpegurl")
-            if self.path.startswith("/seg_") and self.path.endswith(".ts"):
+            seg_path, _, query = self.path.partition("?")
+            if seg_path.startswith("/seg_") and seg_path.endswith(".ts"):
                 if state.path is None:
                     return self.reply(404, b"no stream", "text/plain")
+                if state.epoch_urls and query != f"epoch={state.epoch}":
+                    # Jasna 0.11: without the current epoch a segment that is
+                    # not on disk is a plain 404 and no seek happens. The fake
+                    # has no disk, so it refuses every such request outright.
+                    return self.reply(404, b"stale or missing epoch", "text/plain")
+                self.path = seg_path
                 sf = state.stall_file
                 if sf and os.path.exists(sf):
                     try:
@@ -192,13 +203,23 @@ def make_handler(state: FakeJasna):
                 with state.lock:
                     state.path = path
                     state.opens.append(path)
+                    state.epoch += 1
                     state.last_seg = None  # a new file: the next request starts a pass
                 return self.reply(200, b'{"ok":true}')
-            if self.path == "/stop":
+            if self.path == "/stop" and not state.delete_only:
                 with state.lock:
                     state.path = None
                     state.stops += 1
                 return self.reply(200, b'{"ok":true}')
+            self.reply(404, b"not found", "text/plain")
+
+        def do_DELETE(self):
+            self._maybe_hang()
+            if self.path == "/open":  # Jasna 0.11: closes the stream (0.10 has no such route)
+                with state.lock:
+                    state.path = None
+                    state.stops += 1
+                return self.reply(200, b'{"status":"stopped"}')
             self.reply(404, b"not found", "text/plain")
 
     return H
@@ -216,6 +237,12 @@ def start(port: int = 0, open_delay: float = 0.0, hang_file: str | None = None,
 if __name__ == "__main__":
     port, delay, hang, stall = 8765, 0.0, None, None
     args = sys.argv[1:]
+    if "--help" in args:
+        # The bridge probes `jasna --help` for the license flags when the
+        # binary's path carries no version; answer like Jasna 0.10.
+        print("usage: fake jasna [--stream] [--stream-port PORT] [--license-email EMAIL] [--license-key KEY]")
+        sys.exit(0)
+    epoch_urls = "--epoch-urls" in args
     for i, a in enumerate(args):
         if a == "--stream-port":
             port = int(args[i + 1])
@@ -225,7 +252,8 @@ if __name__ == "__main__":
             hang = args[i + 1]
         if a == "--stall-file":
             stall = args[i + 1]
-    server, _ = start(port, delay, hang, stall)
+    server, state = start(port, delay, hang, stall)
+    state.epoch_urls = epoch_urls
     print(f"fake jasna on {port}", flush=True)
     try:
         while True:

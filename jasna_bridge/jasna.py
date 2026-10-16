@@ -7,6 +7,17 @@ Jasna facts this relies on (verified against 0.10.0, see notes):
   GET  /stream.m3u8        static VOD playlist for the whole file
   GET  /seg_NNNNN.ts       rendered on demand, blocks up to ~30s
 Settings are launch flags only, so a preset change means a restart.
+
+Jasna 0.11.1 (verified 2026-10-16) keeps all of that except:
+  DELETE /open             replaces POST /stop (which now 404s)
+  GET  /status             omits "path" while idle
+  playlist entries read seg_NNNNN.ts?epoch=N; the epoch bumps on every
+  /open. A segment request must carry the current epoch to make Jasna
+  seek: a bare or stale-epoch request for a segment that is not on disk
+  is an immediate 404 and starts no pass (measured: bare seg_00300 stayed
+  404 for 90s; seg_00900?epoch=1 seeked and served in 5s). Requests near
+  the live edge wait either way. So the client learns the epoch from the
+  playlist after every open and sends it with each segment fetch.
 """
 from __future__ import annotations
 
@@ -14,6 +25,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -56,6 +68,47 @@ def jasna_license_candidates() -> list[str]:
     return out
 
 
+# Jasna 0.11 replaced the supporter email + key (``--license-email`` /
+# ``--license-key``, stored in license.json) with a per-machine activation
+# (``--machine-key`` / ``--license-code`` / ``--activation-key``) that Jasna
+# keeps in its own config folder. Passing the old flags to 0.11 is a fatal
+# argparse error ("unrecognized arguments", exit 2; verified on 0.11.1), so
+# the bridge must know which Jasna it is starting.
+LICENSE_FLAGS_DROPPED_IN = (0, 11, 0)
+_EPOCH_RE = re.compile(rb"^seg_[0-9]{5}\.ts\?epoch=([A-Za-z0-9_-]+)\s*$", re.M)
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def jasna_version_from_path(binary: str) -> tuple[int, int, int] | None:
+    """The version encoded in the binary's (resolved) path, e.g.
+    '.../jasna-linux-nvidia-0.11.1/jasna' -> (0, 11, 1); None if absent."""
+    if not binary:
+        return None
+    m = _VERSION_RE.search(os.path.realpath(binary))
+    return tuple(int(g) for g in m.groups()) if m else None  # type: ignore[return-value]
+
+
+def jasna_accepts_license_flags(binary: str, timeout: float = 120.0) -> bool | None:
+    """Ask ``binary --help`` whether it still takes --license-key. True/False
+    when the help text settles it, None when it names neither flag (not a
+    Jasna help text, or the probe failed). Needs no GPU or port; 0.11 first
+    prints its installation check, which can take a few seconds."""
+    if not binary:
+        return None
+    cwd = os.path.dirname(os.path.abspath(binary)) or None
+    try:
+        out = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL, cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    text = (out.stdout or "") + (out.stderr or "")
+    if "--license-key" in text:
+        return True
+    if "--activation-key" in text:
+        return False
+    return None
+
+
 class JasnaError(Exception):
     pass
 
@@ -67,6 +120,7 @@ class JasnaClient:
         self.host = parsed.hostname or "127.0.0.1"
         self.port = parsed.port or 80
         self.timeout = timeout
+        self.epoch: str | None = None  # Jasna 0.11's per-open stream epoch, from the playlist; None on 0.10
 
     def _request(self, method: str, path: str, body: bytes | None = None, timeout: float | None = None):
         headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -84,6 +138,7 @@ class JasnaClient:
 
     def open(self, path: str) -> None:
         body = json.dumps({"path": path}).encode()
+        self.epoch = None  # every /open starts a new epoch; wait_ready()/playlist() picks it up
         try:
             with self._request("POST", "/open", body, timeout=max(self.timeout, 30)) as resp:
                 resp.read()
@@ -94,10 +149,28 @@ class JasnaClient:
             raise JasnaError(f"/open failed: {err}") from err
 
     def stop(self) -> bool:
+        """Close the open stream: DELETE /open (Jasna 0.11+), falling back to
+        POST /stop (0.10) when the server does not know the new route."""
+        try:
+            with self._request("DELETE", "/open") as resp:
+                resp.read()
+            return True
+        except urllib.error.HTTPError as err:
+            err.close()
+            if err.code not in (404, 405, 501):
+                log.warning("DELETE /open failed: HTTP %s", err.code)
+                return False
+        except (urllib.error.URLError, OSError) as err:
+            log.warning("DELETE /open failed: %s", err)
+            return False
         try:
             with self._request("POST", "/stop", b"{}") as resp:
                 resp.read()
             return True
+        except urllib.error.HTTPError as err:
+            err.close()
+            log.warning("/stop failed: HTTP %s", err.code)
+            return False
         except (urllib.error.URLError, OSError) as err:
             log.warning("/stop failed: %s", err)
             return False
@@ -106,7 +179,10 @@ class JasnaClient:
         """The manifest bytes, or None if Jasna has no stream open."""
         try:
             with self._request("GET", "/stream.m3u8", timeout=5.0) as resp:
-                return resp.read()
+                data = resp.read()
+            m = _EPOCH_RE.search(data)
+            self.epoch = m.group(1).decode() if m else None
+            return data
         except urllib.error.HTTPError as err:
             err.close()  # wait_ready() polls this every 0.25s; each 404 leaked a socket
             return None
@@ -127,7 +203,7 @@ class JasnaClient:
         leaves an HTTP/1.1 connection's socket open: one leak per segment)."""
         conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         try:
-            conn.request("GET", "/" + name)
+            conn.request("GET", "/" + name + (f"?epoch={self.epoch}" if self.epoch else ""))
             resp = conn.getresponse()
         except BaseException:
             conn.close()
@@ -197,11 +273,38 @@ class ProcessManager:
             *flags, *self._license_flags(flags),
         ]
 
+    def license_flags_supported(self) -> bool:
+        """True if the configured Jasna takes --license-email/--license-key
+        (0.10 and earlier), False for 0.11+, which activates per machine.
+        Decided once per process: from the version in the binary's path, else
+        from a `--help` probe; a binary that answers neither way is assumed
+        old (the behaviour before 0.11 existed)."""
+        cached = getattr(self, "_license_flags_supported", None)
+        if cached is not None:
+            return cached
+        version = jasna_version_from_path(self.cfg.jasna_binary)
+        if version is not None:
+            supported = version < LICENSE_FLAGS_DROPPED_IN
+            how = "version %s from the binary path" % ".".join(map(str, version))
+        else:
+            probe = jasna_accepts_license_flags(self.cfg.jasna_binary)
+            supported = True if probe is None else probe
+            how = "--help probe" if probe is not None else "no version in the path and --help was inconclusive; assuming the pre-0.11 flags"
+        log.info("Jasna %s --license-email/--license-key (%s)", "takes" if supported else "does not take", how)
+        self._license_flags_supported = supported
+        return supported
+
     def _license_flags(self, existing: list[str]) -> list[str]:
         """--license-email/--license-key read from Jasna's own store, so the
         key need not be duplicated in bridge.toml. Skipped if already supplied
-        in the flags, or if the store is missing/unreadable. Cached; logged once."""
+        in the flags, if the store is missing/unreadable, or if this Jasna is
+        0.11+ (activated per machine; the flags would abort it). Cached; logged once."""
         if "--license-email" in existing or "--license-key" in existing:
+            if not getattr(self, "_warned_manual_license", False) and not self.license_flags_supported():
+                self._warned_manual_license = True
+                log.warning("common_flags/preset flags carry --license-email/--license-key, which this Jasna "
+                            "(0.11+) rejects at startup; remove them and activate Jasna once with "
+                            "`jasna --activation-key ...` (or --license-code)")
             return []
         cached = getattr(self, "_license_cache", "unset")
         if cached != "unset":
@@ -223,7 +326,13 @@ class ProcessManager:
                 continue
             found = path
             email, key = data.get("email"), data.get("key")
-            if email and key:
+            if not self.license_flags_supported():
+                # 0.11+ keeps its per-machine activation in this same file, without
+                # email/key; nothing to pass, and no warning: a missing activation
+                # shows up in Jasna's own log ("unet-4x is a supporter feature").
+                log.info("Jasna 0.11+ activates per machine (%s); run `jasna --activation-key ...` "
+                         "once if supporter models (unet-4x) are missing", path)
+            elif email and key:
                 flags = ["--license-email", str(email), "--license-key", str(key)]
                 log.info("using Jasna license for %s from %s", email, path)
             else:

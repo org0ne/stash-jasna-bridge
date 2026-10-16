@@ -18,7 +18,9 @@ from __future__ import annotations
 import math
 import re
 
-SEG_RE = re.compile(r"^seg_([0-9]{5})\.ts$")
+# Jasna 0.11 appends ?epoch=N (bumped on every /open) to each entry; the
+# bridge serves segments by name alone, so the query is matched and ignored.
+SEG_RE = re.compile(r"^seg_([0-9]{5})\.ts(?:\?[^\s]*)?$")
 EXTINF_RE = re.compile(r"^#EXTINF:([0-9.]+)")
 MIN_DURATION_S = 0.01
 

@@ -33,9 +33,15 @@ python3 -m jasna_bridge install --stash-url http://127.0.0.1:9999
 `install` finds the Jasna binary, writes `bridge.toml` and a systemd **user**
 unit, enables linger, starts it, and prints the two steps it cannot do for
 you: the firewall rule (needs sudo) and the reverse-proxy `/jasna` location.
-The Jasna license is read from Jasna's own store, so no key goes in
-`bridge.toml` (Linux `~/.config/jasna`, Windows `%LOCALAPPDATA%\jasna`,
-macOS `~/Library/Application Support/jasna`; `jasna.license_file` overrides). Then:
+No license goes in `bridge.toml`. With Jasna 0.10 the bridge reads the
+supporter email and key from Jasna's own store (Linux `~/.config/jasna`,
+Windows `%LOCALAPPDATA%\jasna`, macOS `~/Library/Application Support/jasna`;
+`jasna.license_file` overrides) and passes them at launch. Jasna 0.11 dropped
+those flags for a per-machine activation it keeps itself: activate once with
+`jasna --license-code CODE` (online) or `jasna --machine-key` plus
+`jasna --activation-key KEY`, and the bridge passes nothing. The bridge tells
+the versions apart by the version in the binary's path (`jasna-linux-nvidia-0.11.1/`),
+or by asking `jasna --help` when the path has none. Then:
 
 ```sh
 python3 -m jasna_bridge doctor      # pass/fail check of the whole path; exits 1 on a failure
@@ -187,7 +193,8 @@ optional `[[paths.map]]` rewrites.
 - **Linger.** After release the Jasna stream stays open for
   `session.stream_linger_s` (120s); a new session for the same file and
   preset reuses it (`reused: true`, ~0.02s instead of a cold `/open`).
-  Then `/stop`. A different file pre-empts a lingering stream immediately.
+  Then the stream is closed (`DELETE /open` on Jasna 0.11, `POST /stop` on
+  0.10). A different file pre-empts a lingering stream immediately.
 - **Adoption.** On start, a stream Jasna already has open (started by
   hand, or left by a previous bridge) is tracked as lingering, so it is
   reused or closed rather than leaked.

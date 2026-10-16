@@ -34,7 +34,8 @@ from .mpegts import partial_size, track_spans
 
 log = logging.getLogger("bridge.cache")
 
-SEG_RE = re.compile(r"^seg_[0-9]{5}\.ts$")
+SEG_RE = re.compile(r"^seg_[0-9]{5}\.ts$")                      # cached file / request names
+PLAYLIST_SEG_RE = re.compile(r"^seg_[0-9]{5}\.ts(?:\?[^\s]*)?$")  # playlist entries (0.11: ?epoch=N)
 
 
 def version_from_binary(binary: str) -> str:
@@ -121,7 +122,7 @@ class SegmentCache:
 
     def store_manifest(self, key: str, path: str, preset: str, flags: list[str], playlist: bytes) -> None:
         text = playlist.decode(errors="replace")
-        n = len([ln for ln in text.splitlines() if SEG_RE.match(ln.strip())])
+        n = len([ln for ln in text.splitlines() if PLAYLIST_SEG_RE.match(ln.strip())])
         with self.lock:
             meta = self.metas.get(key) or {}
             if meta.get("playlist") == text:

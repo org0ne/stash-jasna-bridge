@@ -87,7 +87,8 @@ def _toml_list(xs) -> str:
 def _write_config(path: str, stash_url: str, binary: str, port: int, presets: dict, default_preset: str) -> None:
     lines = [
         "# stash-jasna-bridge configuration (written by `python3 -m jasna_bridge install`).",
-        "# The Jasna license is read from ~/.config/jasna/license.json automatically.",
+        "# Jasna license: 0.10 reads ~/.config/jasna/license.json automatically; 0.11+ is activated",
+        "# once with `jasna --activation-key KEY` (nothing goes in this file either way).",
         "",
         "[server]",
         'host = "0.0.0.0"           # reachable from the reverse-proxy host',
@@ -240,23 +241,36 @@ def doctor(args) -> int:
     if cfg.manage_process:
         _check(f"Jasna binary {cfg.jasna_binary}",
                      bool(cfg.jasna_binary) and os.path.isfile(cfg.jasna_binary) and os.access(cfg.jasna_binary, os.X_OK))
-        from .jasna import jasna_license_candidates
-        lic_paths = [os.path.expanduser(cfg.jasna_license_file)] if cfg.jasna_license_file else jasna_license_candidates()
-        lic_found = None
-        for lp in lic_paths:
-            try:
-                with open(lp) as fh:
-                    d = json.load(fh)
-                lic_found = (lp, bool(d.get("email") and d.get("key")))
-                break
-            except (OSError, ValueError):
-                continue
-        if lic_found:
-            _check(f"Jasna license {lic_found[0]}", lic_found[1],
-                   "unet-4x enabled" if lic_found[1] else "no key: unet-4x disabled")
+        from .jasna import (LICENSE_FLAGS_DROPPED_IN, jasna_accepts_license_flags, jasna_license_candidates,
+                            jasna_version_from_path)
+        version = jasna_version_from_path(cfg.jasna_binary)
+        if version is not None:
+            old_flags = version < LICENSE_FLAGS_DROPPED_IN
+            how = "Jasna " + ".".join(map(str, version))
         else:
-            print(f"  [WARN] Jasna license - not found (looked in {', '.join(lic_paths)}); "
-                  "unet-4x disabled, hq still works")
+            probe = jasna_accepts_license_flags(cfg.jasna_binary) if os.path.isfile(cfg.jasna_binary or "") else None
+            old_flags = True if probe is None else probe
+            how = "per --help" if probe is not None else "version unknown, assuming pre-0.11"
+        if old_flags:
+            lic_paths = [os.path.expanduser(cfg.jasna_license_file)] if cfg.jasna_license_file else jasna_license_candidates()
+            lic_found = None
+            for lp in lic_paths:
+                try:
+                    with open(lp) as fh:
+                        d = json.load(fh)
+                    lic_found = (lp, bool(d.get("email") and d.get("key")))
+                    break
+                except (OSError, ValueError):
+                    continue
+            if lic_found:
+                _check(f"Jasna license {lic_found[0]} ({how})", lic_found[1],
+                       "unet-4x enabled" if lic_found[1] else "no key: unet-4x disabled")
+            else:
+                print(f"  [WARN] Jasna license - not found (looked in {', '.join(lic_paths)}); "
+                      "unet-4x disabled, hq still works")
+        else:
+            print(f"  [INFO] Jasna license ({how}) - 0.11+ activates per machine, license.json is not used; "
+                  "if unet-4x is missing run `jasna --machine-key`, then `jasna --activation-key KEY` once")
         free = _port_free(cfg.jasna_stream_port)
         running = subprocess.run(["pgrep", "-f", f"stream-port {cfg.jasna_stream_port}"],
                                  stdout=subprocess.DEVNULL).returncode == 0 if shutil.which("pgrep") else False

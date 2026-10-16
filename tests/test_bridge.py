@@ -248,6 +248,99 @@ class SessionFlow(unittest.TestCase):
         self.assertEqual(self.h.jasna.opens, ["/mnt/pool/b/two.mp4"])
 
 
+class Jasna011Dialect(unittest.TestCase):
+    """Jasna 0.11 changed three things the bridge touches (verified live 2026-10-16):
+    playlist entries read seg_NNNNN.ts?epoch=N, POST /stop is gone in favour of
+    DELETE /open, and /status omits "path" while idle."""
+
+    def setUp(self):
+        self.h = BridgeHarness()
+        self.h.jasna.epoch_urls = True
+        self.h.jasna.delete_only = True
+
+    def tearDown(self):
+        self.h.close()
+
+    def test_epoch_playlist_is_counted_retimed_and_served(self):
+        h = self.h
+        st, body, _ = h.call("POST", "/session", {"scene_id": "1", "time": 0})
+        self.assertEqual(st, 200, body)
+        token = body["token"]
+        st, pl, _ = h.call("GET", body["playlist_path"])
+        self.assertEqual(st, 200)
+        self.assertIn(b"seg_00000.ts?epoch=1", pl)
+        # The cache counted the entries despite the query (a 0 count would never mark a stream complete).
+        key = h.sessions.get(token).cache_key
+        self.assertGreater(h.cache.metas[key]["segments"], 0)
+        # hls.js asks for the entry as written; the bridge serves it by name.
+        st, seg, hdr = h.call("GET", f"/hls/{token}/seg_00000.ts?epoch=1")
+        self.assertEqual(st, 200)
+        self.assertIn(b"seg_00000.ts:", seg)
+        self.assertEqual(hdr["X-Bridge-Cache"], "miss")
+        # Re-timing still finds the entries: the playlist is re-served with the
+        # fetched segment's real start and the header that says so.
+        st, pl2, hdr2 = h.call("GET", body["playlist_path"])
+        self.assertEqual(st, 200)
+        self.assertIn(b"seg_00000.ts?epoch=1", pl2)
+        self.assertEqual(retime(pl2.decode(), {0: 1.4 + 0.25}, 1.4)[1], 1)
+
+    def test_segment_fetches_carry_the_current_epoch(self):
+        # The fake 404s any segment request without ?epoch=<current>, as 0.11
+        # does for segments not yet rendered (and it never seeks for them).
+        h = self.h
+        st, body, _ = h.call("POST", "/session", {"scene_id": "1", "time": 30})
+        self.assertEqual(st, 200, body)
+        token = body["token"]
+        self.assertEqual(h.sessions.jasna.epoch, "1")
+        st, seg, _ = h.call("GET", f"/hls/{token}/seg_00007.ts?epoch=1")
+        self.assertEqual(st, 200, seg)
+        self.assertIn(b"seg_00007.ts:", seg)
+        # A second /open (another file) bumps the epoch and the client follows.
+        h.call("POST", f"/session/{token}/end")
+        st, body2, _ = h.call("POST", "/session", {"scene_id": "2", "time": 0})
+        self.assertEqual(st, 200, body2)
+        self.assertEqual(h.sessions.jasna.epoch, "2")
+        st, seg, _ = h.call("GET", f"/hls/{body2['token']}/seg_00001.ts?epoch=2")
+        self.assertEqual(st, 200, seg)
+
+    def test_stream_closed_with_delete_open(self):
+        h = self.h
+        st, body, _ = h.call("POST", "/session", {"scene_id": "1", "time": 0})
+        self.assertEqual(st, 200, body)
+        h.call("POST", f"/session/{body['token']}/end")
+        time.sleep(1.2)
+        self.assertEqual(h.jasna.stops, 1)  # closed via DELETE /open; POST /stop 404s on this dialect
+        st, snap, _ = h.call("GET", "/session")
+        self.assertIsNone(snap["stream"]["path"])
+
+    def test_stop_falls_back_to_post_stop_on_0_10(self):
+        # A 0.10 server knows no DELETE /open (404); the client must then POST /stop.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = []
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _reply(self, code):
+                self.send_response(code); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}")
+
+            def do_DELETE(self):
+                seen.append(("DELETE", self.path)); self._reply(404)
+
+            def do_POST(self):
+                seen.append(("POST", self.path)); self._reply(200)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        import threading
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.assertTrue(JasnaClient(f"http://127.0.0.1:{srv.server_address[1]}").stop())
+        finally:
+            srv.shutdown()
+        self.assertEqual(seen, [("DELETE", "/open"), ("POST", "/stop")])
+
+
 class Auth(unittest.TestCase):
     def test_token(self):
         h = BridgeHarness({"auth": {"mode": "token", "token": "s3cret"}})
@@ -316,6 +409,61 @@ class License(unittest.TestCase):
         pm = self._pm({"license_file": "/no/such/license.json"})
         cmd = pm.command("a")
         self.assertNotIn("--license-email", cmd)
+
+    def _binary(self, dirname: str, help_text: str) -> str:
+        """An executable in a directory named `dirname` that prints `help_text` for --help."""
+        d = os.path.join(tempfile.mkdtemp(prefix="bridge-lic-"), dirname)
+        os.makedirs(d)
+        bin_path = os.path.join(d, "jasna")
+        with open(bin_path, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '%s\\n' \"" + help_text + "\"\n")
+        os.chmod(bin_path, 0o755)
+        return bin_path
+
+    def _license_file(self) -> str:
+        d = tempfile.mkdtemp(prefix="bridge-lic-")
+        lic = os.path.join(d, "license.json")
+        with open(lic, "w") as fh:
+            json.dump({"email": "a@b.c", "key": "SECRET"}, fh)
+        return lic
+
+    def test_license_flags_skipped_for_jasna_0_11_by_path(self):
+        # 0.11 rejects --license-email/--license-key outright (argparse exit 2);
+        # the version in the install folder's name settles it without a probe.
+        bin_path = self._binary("jasna-linux-nvidia-0.11.1", "usage: never probed")
+        pm = self._pm({"license_file": self._license_file(), "binary": bin_path})
+        cmd = pm.command("a")
+        self.assertNotIn("--license-email", cmd)
+        self.assertNotIn("--license-key", cmd)
+        self.assertFalse(pm.license_flags_supported())
+
+    def test_license_flags_kept_for_jasna_0_10_by_path(self):
+        bin_path = self._binary("jasna-linux-nvidia-0.10.0", "usage: never probed")
+        pm = self._pm({"license_file": self._license_file(), "binary": bin_path})
+        cmd = pm.command("a")
+        self.assertEqual(cmd[cmd.index("--license-key") + 1], "SECRET")
+
+    def test_license_flags_decided_by_help_probe_without_path_version(self):
+        from jasna_bridge import jasna as jm
+        new = self._binary("jasna", "usage: jasna [--machine-key] [--activation-key KEY]")
+        old = self._binary("jasna", "usage: jasna [--license-email EMAIL] [--license-key KEY]")
+        self.assertIs(jm.jasna_accepts_license_flags(new), False)
+        self.assertIs(jm.jasna_accepts_license_flags(old), True)
+        self.assertIsNone(jm.jasna_accepts_license_flags("/bin/true"))  # says neither
+        lic = self._license_file()
+        self.assertNotIn("--license-key", self._pm({"license_file": lic, "binary": new}).command("a"))
+        self.assertIn("--license-key", self._pm({"license_file": lic, "binary": old}).command("a"))
+        # Inconclusive: keep the pre-0.11 behaviour.
+        self.assertIn("--license-key", self._pm({"license_file": lic, "binary": "/bin/true"}).command("a"))
+
+    def test_manual_license_flags_not_duplicated_but_warned_on_0_11(self):
+        bin_path = self._binary("jasna-linux-nvidia-0.11.1", "usage: never probed")
+        pm = self._pm({"license_file": self._license_file(), "binary": bin_path,
+                       "common_flags": ["--license-email", "m@x.y", "--license-key", "MANUAL"]})
+        with self.assertLogs("bridge.jasna", level="WARNING") as logs:
+            cmd = pm.command("a")
+        self.assertEqual(cmd.count("--license-key"), 1)  # the user's own flag is passed through as before
+        self.assertTrue(any("rejects" in line for line in logs.output))
 
     def test_license_candidates_are_platform_appropriate(self):
         import importlib, jasna_bridge.jasna as jm

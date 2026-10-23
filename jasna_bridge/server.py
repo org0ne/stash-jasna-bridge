@@ -55,12 +55,13 @@ ROUTES = [
 class Bridge:
     """Shared state handed to every request handler."""
 
-    def __init__(self, cfg, sessions, stash: StashClient, jobs=None):
+    def __init__(self, cfg, sessions, stash: StashClient, jobs=None, gpu=None):
         self.cfg = cfg
         self.sessions = sessions
         self.cache = getattr(sessions, "cache", None)
         self.stash = stash
         self.jobs = jobs  # JobQueue, or None when batch.enabled = false
+        self.gpu = gpu    # GpuSampler, or None
         self.cookies = CookieValidator(stash, cfg.auth_cache_s) if cfg.auth_mode == "stash_cookie" else None
         self.started = time.time()
 
@@ -211,6 +212,7 @@ class Handler(BaseHTTPRequestHandler):
             },
             "cache": b.cache.snapshot() if b.cache else {"enabled": False},
             "batch": b.jobs.snapshot() if b.jobs else {"enabled": False},
+            "gpu": b.gpu.snapshot() if b.gpu else None,
             **b.sessions.snapshot(),
         })
 
@@ -548,8 +550,8 @@ class BridgeServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def serve(cfg, sessions, stash: StashClient, jobs=None) -> ThreadingHTTPServer:
-    bridge = Bridge(cfg, sessions, stash, jobs)
+def serve(cfg, sessions, stash: StashClient, jobs=None, gpu=None) -> ThreadingHTTPServer:
+    bridge = Bridge(cfg, sessions, stash, jobs, gpu)
     handler = type("BridgeHandler", (Handler,), {"bridge": bridge})
     server = BridgeServer((cfg.host, cfg.port), handler)
     server.bridge = bridge

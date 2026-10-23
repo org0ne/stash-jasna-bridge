@@ -47,7 +47,33 @@
   .bar i { display: block; height: 100%; width: 0; background: var(--run); transition: width .6s ease; }
   .bar.unknown { background: repeating-linear-gradient(90deg, var(--chip) 0 6px, var(--line) 6px 12px); }
   .sub.prog { font-variant-numeric: tabular-nums; }
+  .passes { grid-column: 1 / 4; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: center;
+    margin-top: 10px; font-size: 13px; }
+  .passes .lbl { color: var(--text); font-weight: 600; white-space: nowrap; }
+  .passes .lbl span { color: var(--muted); font-weight: 400; }
+  .steps { display: flex; gap: 4px; }
+  .steps.solo { grid-column: 1 / 3; }
+  .steps i { flex: 1; height: 7px; border-radius: 4px; background: var(--chip); overflow: hidden; }
+  .steps i b { display: block; height: 100%; width: 0; background: var(--run); transition: width .6s ease; }
+  .steps i.done b { opacity: .45; }
+  .steps i.now b { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  @media (max-width: 480px) { .passes { grid-template-columns: 1fr; } }
   .empty { color: var(--muted); padding: 6px 2px; }
+  .gpu { padding: 10px 14px 10px; margin-bottom: 14px; }
+  .gpu-h { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .gpu-h b { color: var(--text); font-size: 15px; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+  .spark-wrap { position: relative; height: 44px; margin: 6px 0 0; }
+  .spark { display: block; width: 100%; height: 100%; }
+  .spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+  .spark polygon { fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: none; }
+  .spark-wrap .dot { position: absolute; right: 0; width: 6px; height: 6px; margin: -3px -3px 0 0;
+    border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--card); }
+  .gpu .bar { margin: 6px 0 4px; grid-column: auto; }
+  .gpu .bar i { background: var(--accent); }
+  .gpu .bar i.w { background: var(--warn); } .gpu .bar i.f { background: var(--bad); }
+  .gpu-m { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .foot { margin-top: 24px; font-size: 12px; color: var(--muted); }
   .foot a { color: inherit; }
   @media (max-width: 480px) { .row { grid-template-columns: auto 1fr; } .row > button, .row > a.log { grid-column: 2; justify-self: start; } }
@@ -60,6 +86,8 @@
     <span id="status" class="pill">loading</span>
     <span id="meta" class="meta"></span>
   </header>
+
+  <section id="gpu" class="card gpu" hidden></section>
 
   <section class="running">
     <h2>Running</h2>
@@ -82,8 +110,7 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const titles = {};            // scene id -> Stash title (from Stash GraphQL, same origin)
-  let titlesWanted = new Set();
+  const scenes = {};            // scene id -> {title, duration} (from Stash GraphQL, same origin)
 
   const fmtDur = (s) => {
     if (s == null) return "";
@@ -102,8 +129,16 @@
   const base = (j) => (j.stash_source || "").split("/").pop();
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+  const fmtClock = (s) => {     // a film's length: 2h 02m, 48m
+    if (s == null) return "";
+    s = Math.round(s);
+    const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+  };
+  const duration = (j) => (scenes[j.scene_id] || {}).duration;
+
   function sceneLink(j) {
-    const t = titles[j.scene_id];
+    const t = (scenes[j.scene_id] || {}).title;
     const label = t ? esc(t) : esc(base(j));
     return `<a href="/scenes/${encodeURIComponent(j.scene_id)}" title="scene ${esc(j.scene_id)}">${label}</a>`;
   }
@@ -122,13 +157,35 @@
   }
   window.__cancel = cancel;
 
+  // Progress as one bar per pass: finished passes full, the current one
+  // filled to Jasna's percent for it, the rest empty. Jasna's own bar
+  // restarts for each pass, so this is the honest shape of the run. An LTX
+  // job always makes 4 passes (scan, encode, denoise, compose), so an LTX
+  // job that has not printed a bar yet already shows 4 empty segments; a
+  // job whose bars carry no pass label gets a single segment.
+  const LTX_STAGES = ["scan", "encode", "denoise", "compose"];
+  const isLtx = (j) => (j.flags || []).some((f, i, a) => a[i - 1] === "--restoration-model-name" && /^ltx/i.test(f));
   function progressBar(j) {
-    const p = j.progress;
-    if (!p || p.percent == null) return '<span class="bar unknown"></span><span class="sub prog">progress not reported yet</span>';
-    const bits = [`${p.percent}%`];
-    if (p.eta_s != null) bits.push(`ETA ${fmtDur(p.eta_s)}`);
-    if (p.rate) bits.push(p.rate);
-    return `<span class="bar"><i style="width:${p.percent}%"></i></span>
+    const p = j.progress || {};
+    const pct = p.percent;
+    const total = p.passes || (isLtx(j) ? LTX_STAGES.length : 1);
+    const cur = p.pass || (pct != null ? 1 : 0);
+    const steps = Array.from({ length: total }, (_, i) => {
+      const n = i + 1;
+      const fill = n < cur ? 100 : n === cur && pct != null ? pct : 0;
+      const name = total === LTX_STAGES.length ? `: ${LTX_STAGES[i]}` : "";
+      return `<i class="${n < cur ? "done" : n === cur ? "now" : ""}" title="pass ${n}${name}"><b style="width:${fill}%"></b></i>`;
+    }).join("");
+    const label = total > 1
+      ? (cur ? `Pass ${cur} of ${total}${p.stage ? ` <span>· ${esc(p.stage)}</span>` : ""}` : `${total} passes <span>· preparing</span>`)
+      : "";
+    const bits = pct == null ? ["progress not reported yet"] : [`${pct}%`];
+    if (pct != null) {
+      if (p.eta_s != null) bits.push(cur && total > 1 ? `pass ETA ${fmtDur(p.eta_s)}` : `ETA ${fmtDur(p.eta_s)}`);
+      if (p.run_left_s != null) bits.push(`${fmtDur(p.run_left_s)} left in all`);
+      if (p.rate) bits.push(p.rate);
+    }
+    return `<span class="passes">${label ? `<span class="lbl">${label}</span>` : ""}<span class="steps${label ? "" : " solo"}">${steps}</span></span>
       <span class="sub prog">${esc(bits.join(" · "))}</span>`;
   }
 
@@ -145,24 +202,61 @@
       <span class="pos">${pos != null ? pos : `<span class="pill ${cls}">${esc(st)}</span>`}</span>
       <span class="title">${sceneLink(j)}</span>
       ${action}
-      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}</span>
+      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))}${duration(j) ? " · " + fmtClock(duration(j)) : ""} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}</span>
       ${j.error ? `<span class="err">${esc(j.error)}</span>` : ""}
       ${st === "running" ? progressBar(j) : ""}
     </div></div>`;
   }
 
-  async function loadTitles(ids) {
-    const missing = ids.filter((id) => !(id in titles));
+  // One aliased findScene per id in a single request: findScenes(ids:) fails
+  // the whole query when any scene has since been deleted (a finished job's
+  // original, say), while findScene just answers null for that one.
+  async function loadScenes(ids) {
+    const missing = [...new Set(ids)].filter((id) => /^\d+$/.test(id) && !(id in scenes));
     if (!missing.length) return;
     try {
+      const q = "{ " + missing.map((id, i) => `s${i}: findScene(id:"${id}") { title files { duration } }`).join(" ") + " }";
       const r = await fetch("/graphql", {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "query Q($ids:[ID!]) { findScenes(ids:$ids) { scenes { id title } } }", variables: { ids: missing } }),
+        body: JSON.stringify({ query: q }),
       });
       const d = await r.json();
-      for (const s of (d.data && d.data.findScenes && d.data.findScenes.scenes) || []) titles[s.id] = s.title || "";
-      for (const id of missing) if (!(id in titles)) titles[id] = "";
-    } catch (e) { for (const id of missing) titles[id] = ""; }
+      missing.forEach((id, i) => {
+        const s = d.data && d.data[`s${i}`];
+        const f = s ? (s.files || []).find((x) => x && x.duration) || {} : {};
+        scenes[id] = s ? { title: s.title || "", duration: f.duration || null } : {};
+      });
+    } catch (e) { for (const id of missing) scenes[id] = {}; }
+  }
+
+  // Whole-GPU load from the bridge's nvidia-smi sampler (health.gpu): a
+  // utilization sparkline over the last few minutes, the VRAM bar and the
+  // card's name. Hidden where the bridge reports no GPU.
+  function renderGpu(g) {
+    const el = $("gpu");
+    if (!g || !g.mem_total) { el.hidden = true; return; }
+    const clamp = (v) => Math.max(0, Math.min(100, v));
+    const h = (g.history || []).map(clamp);
+    const gb = (m) => (m / 1024).toFixed(1);
+    const memPct = Math.round(100 * g.mem_used / g.mem_total);
+    const memCls = memPct >= 90 ? "f" : memPct >= 75 ? "w" : "";
+    let spark = '<div class="spark-wrap"></div>';
+    if (h.length >= 2) {
+      const n = h.length;
+      const line = h.map((v, i) => `${i},${100 - v}`).join(" ");
+      spark = `<div class="spark-wrap">
+        <svg class="spark" viewBox="0 0 ${n - 1} 100" preserveAspectRatio="none" aria-hidden="true">
+          <polygon points="0,100 ${line} ${n - 1},100"/><polyline points="${line}"/>
+        </svg><i class="dot" style="top:${100 - h[n - 1]}%"></i></div>`;
+    }
+    const span = g.interval_s && h.length > 1 ? `last ${fmtDur(g.interval_s * (h.length - 1))}` : "";
+    el.title = `${g.name || "GPU"}: ${g.util}% util, ${gb(g.mem_used)} / ${gb(g.mem_total)} GB VRAM` +
+      (g.sampled_ago != null ? ` (sampled ${Math.round(g.sampled_ago)}s ago)` : "");
+    el.innerHTML = `<div class="gpu-h"><span>GPU ${esc(span)}</span><b>${g.util}%</b></div>${spark}
+      <div class="bar"><i class="${memCls}" style="width:${memPct}%"></i></div>
+      <div class="gpu-m"><span>${gb(g.mem_used)} / ${gb(g.mem_total)} GB VRAM</span>
+        <span>${esc((g.name || "").replace(/^NVIDIA\s+/, ""))}</span></div>`;
+    el.hidden = false;
   }
 
   async function refresh() {
@@ -172,7 +266,8 @@
       const running = jobs.filter((j) => j.state === "running");
       const queued = jobs.filter((j) => j.state === "queued");
       const finished = jobs.filter((j) => !["running", "queued"].includes(j.state)).sort((a, b) => (b.finished || 0) - (a.finished || 0)).slice(0, 25);
-      await loadTitles(jobs.map((j) => j.scene_id));
+      await loadScenes(jobs.map((j) => j.scene_id));
+      renderGpu(health.gpu);
 
       const b = health.batch || {};
       const live = health.active ? "live stream active" : (health.stream && health.stream.path) ? "stream lingering" : "";
@@ -190,7 +285,8 @@
 
       $("running").innerHTML = running.length ? running.map((j) => renderJob(j)).join("") : `<div class="empty">nothing running</div>`;
       $("queued").innerHTML = queued.length ? queued.map((j, i) => renderJob(j, i + 1)).join("") : `<div class="empty">queue is empty</div>`;
-      $("qcount").textContent = queued.length ? `(${queued.length})` : "";
+      const queuedRuntime = queued.reduce((t, j) => t + (duration(j) || 0), 0);
+      $("qcount").textContent = queued.length ? `(${queued.length}${queuedRuntime ? ` · ${fmtClock(queuedRuntime)} of video` : ""})` : "";
       $("finished").innerHTML = finished.length ? finished.map((j) => renderJob(j)).join("") : `<div class="empty">none yet</div>`;
       $("fcount").textContent = finished.length ? `(last ${finished.length})` : "";
     } catch (e) {

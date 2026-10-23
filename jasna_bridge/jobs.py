@@ -659,14 +659,26 @@ class JobQueue:
 
 _PERCENT_RE = re.compile(r"(\d{1,3})%")
 _ETA_RE = re.compile(r"<\s*(\d+):(\d{2})(?::(\d{2}))?")
-_RATE_RE = re.compile(r"([\d.]+)\s*(frames?/s|fps|it/s|s/it)")
+_RATE_RE = re.compile(r"([\d.]+)\s*(frames?/s|fps|it/s|s/it|steps?/s|s/step)")
+# "LTX 4/4 compose:  33%|..." -> pass 4 of 4, stage "compose" (Jasna 0.11.3)
+_PASS_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s+([A-Za-z][\w-]*)")
+# tqdm postfix Jasna adds on multi-pass runs: whole-run time remaining
+_RUN_LEFT_RE = re.compile(r"run\s+(?:(\d+):)?(\d+):(\d{2})\s+left")
+
+
+def _hms(h: str | None, m: str, s: str) -> int:
+    return int(h or 0) * 3600 + int(m) * 60 + int(s)
 
 
 def parse_progress(text: str) -> dict | None:
     """The last progress-bar update in a chunk of Jasna's output. tqdm
     rewrites its line with carriage returns, so the chunk is split on both
     CR and LF and the last piece with a percentage wins. Returns
-    {"percent", "eta_s", "rate", "detail"} or None when there is none."""
+    {"percent", "eta_s", "rate", "detail", "label", "pass", "passes", "stage",
+    "run_left_s"} or None when there is none. percent and eta_s are for the
+    current pass (the bar restarts per pass: an LTX run is "LTX 1/4 scan",
+    "2/4 encode", "3/4 denoise", "4/4 compose"); run_left_s is Jasna's own
+    whole-run estimate from the bar's postfix, when it prints one."""
     for piece in reversed(re.split(r"[\r\n]+", text)):
         m = _PERCENT_RE.search(piece)
         if not m or "%" not in piece:
@@ -676,11 +688,18 @@ def parse_progress(text: str) -> dict | None:
         eta_s = None
         if eta:
             h, mnt, sec = eta.groups()
-            eta_s = (int(h) * 3600 + int(mnt) * 60 + int(sec)) if sec is not None else (int(h) * 60 + int(mnt))
+            eta_s = _hms(h, mnt, sec) if sec is not None else _hms(None, h, mnt)
         rate = _RATE_RE.search(piece)
         detail = piece[m.end():].strip(" |,")
+        label = piece[:m.start()].split("|")[0].strip(" :|\t")   # drop a bar drawn before the percent
+        passes = _PASS_RE.search(label)
+        run_left = _RUN_LEFT_RE.search(piece)
         return {"percent": percent, "eta_s": eta_s, "rate": rate.group(0) if rate else None,
-                "detail": detail[:120]}
+                "detail": detail[:120], "label": label[:60] or None,
+                "pass": int(passes.group(1)) if passes else None,
+                "passes": int(passes.group(2)) if passes else None,
+                "stage": passes.group(3) if passes else None,
+                "run_left_s": _hms(*run_left.groups()) if run_left else None}
     return None
 
 

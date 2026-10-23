@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from jasna_bridge import config  # noqa: E402
 from jasna_bridge.cache import SegmentCache  # noqa: E402
+from jasna_bridge.gpu import GpuSampler  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
 from jasna_bridge.jobs import JobQueue  # noqa: E402
 from jasna_bridge.mpegts import (JASNA_MUX_DELAY_S, looks_partial, partial_size, pcr_values, restamp,  # noqa: E402
@@ -71,11 +72,14 @@ class BridgeHarness:
             self.jobs = JobQueue(self.cfg, self.sessions, stash, lambda p: config.map_path(self.cfg, p))
             self.jobs.POLL_S = 0.2
             self.jobs.start()
-        self.server = serve(self.cfg, self.sessions, stash, self.jobs)
+        self.gpu = GpuSampler(self.cfg)
+        self.gpu.start()
+        self.server = serve(self.cfg, self.sessions, stash, self.jobs, self.gpu)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def close(self):
         self.server.shutdown(); self.server.server_close()
+        self.gpu.stop()
         if self.jobs:
             self.jobs.shutdown()
         self.sessions.shutdown()
@@ -1444,6 +1448,15 @@ class Batch(unittest.TestCase):
         self.assertEqual(p["percent"], 50)
         self.assertEqual(p["eta_s"], 2 * 3600 + 30)
         self.assertEqual(p["rate"], "8.3frames/s")
+        self.assertEqual((p["label"], p["pass"], p["passes"], p["stage"], p["run_left_s"]),
+                         ("Processing Files", None, None, None, None))
+        # Jasna 0.11.3 LTX: one bar per pass, whole-run estimate in the postfix
+        p = parse_progress("LTX 3/4 denoise: 100%|██████████| 3812/3812 [40:01<00:00,  1.59step/s, run 1:00:42 left]\r"
+                           "LTX 4/4 compose:  33%|███▎      | 71448/213709 [19:52<1:05:17, 36.32frame/s, run 39:27 left]")
+        self.assertEqual((p["percent"], p["eta_s"], p["rate"]), (33, 3600 + 5 * 60 + 17, "36.32frame/s"))
+        self.assertEqual((p["label"], p["pass"], p["passes"], p["stage"]), ("LTX 4/4 compose", 4, 4, "compose"))
+        self.assertEqual(p["run_left_s"], 39 * 60 + 27)
+        self.assertEqual(parse_progress("LTX 3/4 denoise: 100%|█| 3812/3812 [40:01<00:00, 1.59step/s, run 1:00:42 left]")["run_left_s"], 3642)
         # a job run with the progress bar on reports percent while running
         st, body, _ = self.submit(flags=["--fake-delay", "3"])
         job_id = body["job"]["id"]
@@ -1457,9 +1470,11 @@ class Batch(unittest.TestCase):
                 break
             time.sleep(0.3)
         self.assertIsNotNone(seen, "no progress reported")
-        self.assertIn("frames/s", seen["rate"])
+        self.assertIn("frame/s", seen["rate"])
+        self.assertEqual(seen["passes"], 4)
+        self.assertIn(seen["stage"], ("scan", "encode", "denoise", "compose"))
         job = self.wait_state(job_id, {"done"})
-        self.assertEqual(job["progress"]["percent"], 100)
+        self.assertEqual((job["progress"]["percent"], job["progress"]["pass"], job["progress"]["stage"]), (100, 4, "compose"))
         self.assertNotIn("--no-progress", job["command"])
 
     def test_running_job_survives_a_bridge_restart(self):
@@ -1503,6 +1518,8 @@ class Batch(unittest.TestCase):
         self.assertIn("text/html", hdr["Content-Type"])
         self.assertIn(b"Jasna queue", body)
         self.assertIn(b'fetch("/graphql"', body)       # scene titles from Stash on the same origin
+        self.assertIn(b'findScene(id:', body)           # one alias per scene: a deleted scene must not blank the rest
+        self.assertIn(b'Pass ${cur} of ${total}', body)  # the running job says which pass it is in
         self.assertIn(b'api("jobs")', body)             # relative, so the path prefix does not matter
         plain = BridgeHarness()
         try:
@@ -1510,6 +1527,33 @@ class Batch(unittest.TestCase):
             self.assertEqual(st, 404)
         finally:
             plain.close()
+
+    def test_health_reports_gpu_load_from_nvidia_smi(self):
+        fake = os.path.join(self.tmp, "nvidia-smi")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\necho '87, 11009, 24564, NVIDIA Fake RTX'\n")
+        os.chmod(fake, 0o755)
+        h = BridgeHarness(overrides={"gpu": {"nvidia_smi_bin": fake, "sample_seconds": 0.05, "history": 3}})
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                st, body, _ = h.call("GET", "/health")
+                self.assertEqual(st, 200)
+                if body.get("gpu") and len(body["gpu"]["history"]) >= 3:
+                    break
+                time.sleep(0.05)
+            g = body["gpu"]
+            self.assertEqual((g["util"], g["mem_used"], g["mem_total"], g["name"]), (87, 11009, 24564, "NVIDIA Fake RTX"))
+            self.assertEqual(g["history"], [87, 87, 87])      # capped at gpu.history samples
+            self.assertLess(g["sampled_ago"], 2)
+        finally:
+            h.close()
+        off = BridgeHarness(overrides={"gpu": {"sample": False}})
+        try:
+            st, body, _ = off.call("GET", "/health")
+            self.assertIsNone(body["gpu"])                    # no graphic rather than a dead gauge
+        finally:
+            off.close()
 
     def test_disabled_bridge_answers_404(self):
         plain = BridgeHarness()

@@ -75,14 +75,14 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | GET | `/hls/{token}/stream.m3u8` | Jasna's VOD manifest, only for the live token |
 | GET | `/hls/{token}/seg_NNNNN.ts` | segment proxied from Jasna (blocks while it renders) |
 | GET | `/presets` | preset names, default, currently running, warm, `custom_allowed` |
-| GET | `/health` | Jasna reachable/streaming/managed/pid/warm + session snapshot |
+| GET | `/health` | Jasna reachable/streaming/managed/pid/warm + session snapshot; `gpu` = whole-GPU util %, VRAM and a short util history from nvidia-smi (`[gpu]`), or null |
 | POST | `/jobs` | `{scene_id, file_path, output_path, preset, flags}` → **201** `{job, position}`; **409** when the same file+preset is already queued or running; **403** outside `batch.output_roots`. Batch jobs, see below |
 | GET | `/jobs[?state=queued,running&unacknowledged=1]` | job list |
 | GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
 | POST | `/jobs/{id}/ack` | the plugin has ingested the result |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
 | GET | `/batch`, `/batch/check` | queue snapshot / environment checks for the plugin's *Check settings* task |
-| GET | `/queue` | the queue as a page for a phone or desktop browser: running job, queued jobs with Remove, last finished ones with their log; refreshes every 5s |
+| GET | `/queue` | the queue as a page for a phone or desktop browser: GPU load sparkline, running job, queued jobs with Remove and each source's duration, last finished ones with their log; refreshes every 5s |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
 through Stash GraphQL (`findScene { files { path } }`) and applies the
@@ -257,8 +257,14 @@ optional `[[paths.map]]` rewrites.
   for LTX.
 - **Progress and restarts.** Jobs run with Jasna's progress bar on
   (`batch.progress`); the bridge reads its last update from the job log
-  every 3s and reports `progress: {percent, eta_s, rate}` on the job, which
-  the `/queue` page draws as a bar. A bridge restart does not lose a
+  every 3s and reports `progress: {percent, eta_s, rate, pass, passes,
+  stage, run_left_s}` on the job. percent and eta_s are for the current
+  pass (Jasna 0.11.3 labels its bars "LTX 1/4 scan", "2/4 encode", "3/4
+  denoise", "4/4 compose", and the bar restarts for each); run_left_s is
+  Jasna's own whole-run estimate from the bar's postfix. The `/queue` page
+  draws one bar segment per pass (finished ones full, the current one at
+  its percent) with the stage name and both estimates. A bridge restart
+  does not lose a
   running job: with `batch.keep_running_on_restart` (default) the bridge
   leaves Jasna running on shutdown and the next bridge adopts it by pid
   (found through `/proc` when the record has none), holds the GPU for it,

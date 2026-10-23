@@ -112,6 +112,13 @@ class Config:
     batch_keep_running_on_restart: bool = True  # a bridge stop leaves the running Jasna alone; the next bridge
                                      # start adopts it (needs KillMode=process in the unit)
 
+    # [gpu]: whole-GPU load sampled with nvidia-smi for the queue page's
+    # sparkline (gpu.py). Off automatically where nvidia-smi is missing.
+    gpu_sample: bool = True
+    gpu_sample_seconds: float = 3.0
+    gpu_history: int = 100           # samples kept (100 x 3 s = 5 min)
+    gpu_nvidia_smi_bin: str = ""     # blank: found on PATH
+
     def preset(self, name: str) -> Preset:
         """Configured preset or a registered custom one; KeyError if neither."""
         try:
@@ -263,6 +270,11 @@ def from_dict(data: dict) -> Config:
     cfg.batch_max_attempts = _get(batch, "max_attempts", cfg.batch_max_attempts)
     cfg.batch_progress = _get(batch, "progress", cfg.batch_progress)
     cfg.batch_keep_running_on_restart = _get(batch, "keep_running_on_restart", cfg.batch_keep_running_on_restart)
+    gpu = data.get("gpu", {})
+    cfg.gpu_sample = _get(gpu, "sample", cfg.gpu_sample)
+    cfg.gpu_sample_seconds = _get(gpu, "sample_seconds", cfg.gpu_sample_seconds)
+    cfg.gpu_history = _get(gpu, "history", cfg.gpu_history)
+    cfg.gpu_nvidia_smi_bin = _get(gpu, "nvidia_smi_bin", cfg.gpu_nvidia_smi_bin)
     if cfg.batch_enabled and not cfg.manage_process:
         raise ValueError("batch.enabled = true requires jasna.manage_process = true (and jasna.binary)")
     for f in cfg.batch_common_flags:

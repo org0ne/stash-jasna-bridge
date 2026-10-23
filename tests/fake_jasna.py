@@ -255,15 +255,20 @@ if __name__ == "__main__":
         if "--no-progress" in args or delay <= 0:
             time.sleep(delay)
         else:
-            # Like Jasna's tqdm bar: the line is rewritten with carriage returns.
-            steps = 4
-            for i in range(1, steps + 1):
-                time.sleep(delay / steps)
-                pct = int(100 * i / steps)
-                left = delay - delay * i / steps
-                sys.stderr.write(f"\rProcessing Files: |{'#' * (pct // 10):<10}| {pct:3d}%  00:0{int(delay - left)}<00:0{int(left)}, 2.5frames/s")
-                sys.stderr.flush()
-            sys.stderr.write("\n")
+            # Like Jasna 0.11.3's tqdm bars: one bar per pass, labelled
+            # "LTX n/4 <stage>:", each line rewritten with carriage returns,
+            # with the whole-run estimate in the postfix.
+            stages = ["scan", "encode", "denoise", "compose"]
+            per_pass = delay / len(stages)
+            for n, stage in enumerate(stages, 1):
+                for pct in (50, 100):
+                    time.sleep(per_pass / 2)
+                    run_left = int(delay - per_pass * (n - 1) - per_pass * pct / 100)
+                    sys.stderr.write(f"\rLTX {n}/4 {stage}: {pct:3d}%|{'#' * (pct // 10):<10}| {pct}/100 "
+                                     f"[00:0{int(per_pass * pct / 100)}<00:0{int(per_pass - per_pass * pct / 100)}, "
+                                     f"2.5frame/s, run {run_left // 60}:{run_left % 60:02d} left]")
+                    sys.stderr.flush()
+                sys.stderr.write("\n")
         if "--fake-fail" in args:
             print("fake jasna: failing on request", file=sys.stderr)
             sys.exit(int(opt("--fake-fail", 3)))

@@ -9,6 +9,7 @@ import threading
 
 from . import VERSION, config
 from .cache import SegmentCache
+from .gpu import GpuSampler
 from .jasna import JasnaClient, ProcessManager
 from .server import serve
 from .sessions import SessionManager
@@ -57,7 +58,9 @@ def main(argv=None) -> int:
         from .jobs import JobQueue
         jobs = JobQueue(cfg, sessions, stash, lambda p: config.map_path(cfg, p))
         jobs.start()
-    server = serve(cfg, sessions, stash, jobs)
+    gpu = GpuSampler(cfg)
+    gpu.start()
+    server = serve(cfg, sessions, stash, jobs, gpu)
 
     done = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -65,6 +68,7 @@ def main(argv=None) -> int:
     done.wait()
     logging.getLogger("bridge").info("shutting down")
     server.shutdown()
+    gpu.stop()
     if jobs is not None:
         jobs.shutdown()
     sessions.shutdown()

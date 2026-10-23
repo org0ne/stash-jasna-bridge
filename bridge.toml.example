@@ -71,6 +71,12 @@ version = ""                # part of the cache key; default parsed from the jas
                             # Set it by hand when manage_process = false, and bump it after a
                             # Jasna upgrade so old restorations are not replayed.
 
+[gpu]                       # whole-GPU load for the queue page's sparkline (nvidia-smi, ~20 ms per sample)
+sample = true               # false: never sample; also off by itself where nvidia-smi is not on PATH
+sample_seconds = 3
+history = 100               # samples kept for the sparkline (100 x 3 s = 5 min)
+nvidia_smi_bin = ""         # blank: found on PATH
+
 [batch]                     # offline jobs queued by the Stash jasna-batch plugin (jasna --input/--output)
 enabled = false             # needs jasna.manage_process = true. One job at a time, on the stream's GPU:
                             #   a running job holds the GPU and POST /session answers 409 {"reason": "batch"}

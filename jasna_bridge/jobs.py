@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -71,6 +72,9 @@ class Job:
     attempts: int = 0
     ingested: bool = False   # the plugin acknowledged it (copied sidecars, scanned, ...)
     notes: list[str] = field(default_factory=list)
+    pid: int | None = None   # Jasna's pid while running (so a restarted bridge can adopt it)
+    # Parsed from Jasna's progress bar in the log: {"percent", "eta_s", "rate", "detail", "updated"}
+    progress: dict | None = None
 
     def public(self) -> dict:
         d = asdict(self)
@@ -100,6 +104,8 @@ class JobQueue:
         self.current: Job | None = None
         self.proc: subprocess.Popen | None = None
         self._cancel_requested: set[str] = set()
+        self._adopt: list[tuple[Job, int]] = []   # running jobs found alive at start, (job, pid)
+        self._save_lock = threading.Lock()        # one writer of the state file at a time
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = threading.Thread(target=self._loop, name="batch", daemon=True)
@@ -109,8 +115,11 @@ class JobQueue:
     def start(self) -> None:
         os.makedirs(self.log_dir, exist_ok=True)
         self._load()
+        for job, pid in self._adopt:
+            threading.Thread(target=self._adopt_running, args=(job, pid), name=f"adopt-{job.id}", daemon=True).start()
         self._worker.start()
-        log.info("batch queue on (%d queued), scratch %s", len(self.queued()), self.scratch_dir)
+        log.info("batch queue on (%d queued, %d adopted), scratch %s", len(self.queued()), len(self._adopt),
+                 self.scratch_dir)
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -118,8 +127,13 @@ class JobQueue:
         with self.lock:
             job, proc = self.current, self.proc
         if proc is not None and proc.poll() is None:
-            log.info("job %s: bridge shutting down, killing Jasna; the job is re-queued at the next start", job.id)
-            self._kill(proc)
+            if self.cfg.batch_keep_running_on_restart:
+                log.info("job %s: bridge shutting down; Jasna (pid %s) keeps running and the next bridge start "
+                         "adopts it", job.id, proc.pid)
+            else:
+                log.info("job %s: bridge shutting down, killing Jasna; the job is re-queued at the next start",
+                         job.id)
+                self._kill(proc)
         self._worker.join(timeout=15)
 
     # ----- persistence -----
@@ -140,6 +154,14 @@ class JobQueue:
                 log.warning("skipping unreadable job record: %s", err)
                 continue
             if job.state == "running":
+                pid = job.pid if job.pid and self._is_job_process(job.pid, job) else self._find_job_pid(job)
+                if pid:
+                    # Still running from the previous bridge: watch it to the end.
+                    job.pid = pid
+                    job.notes.append("bridge restarted while running; adopted")
+                    self._adopt.append((job, pid))
+                    self.jobs[job.id] = job
+                    continue
                 # Interrupted by the last shutdown. Its scratch output is
                 # incomplete; run it again, or give up after max_attempts.
                 if job.attempts >= self.cfg.batch_max_attempts:
@@ -163,9 +185,10 @@ class JobQueue:
             data = {"jobs": [asdict(j) for j in self.jobs.values()], "stats": dict(self.stats)}
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         tmp = self.state_file + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=1)
-        os.replace(tmp, self.state_file)
+        with self._save_lock:
+            with open(tmp, "w") as fh:
+                json.dump(data, fh, indent=1)
+            os.replace(tmp, self.state_file)
 
     # ----- queries -----
     def get(self, job_id: str) -> Job | None:
@@ -372,10 +395,11 @@ class JobQueue:
         work = os.path.join(self.scratch_dir, f"work-{job.id}")
         job.log_file = os.path.join(self.log_dir, f"{job.id}.log")
         cmd = [cfg.jasna_binary, "--input", job.source, "--output", out_tmp, "--working-directory", work,
-               "--no-progress", *cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags]
+               *([] if cfg.batch_progress else ["--no-progress"]),
+               *cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags]
         with self.lock:
             job.state, job.started, job.attempts = "running", time.time(), job.attempts + 1
-            job.command, job.error, job.exit_code = cmd, "", None
+            job.command, job.error, job.exit_code, job.progress, job.pid = cmd, "", None, None, None
             job.jasna_version = self.sessions.procs.version_string() if hasattr(self.sessions.procs, "version_string") else ""
             self.current = job
         self._save()
@@ -397,15 +421,23 @@ class JobQueue:
             return self._finish(job, "failed", f"could not start Jasna: {err}")
         with self.lock:
             self.proc = proc
+            job.pid = proc.pid
+        self._save()
         deadline = time.monotonic() + cfg.batch_job_timeout_h * 3600 if cfg.batch_job_timeout_h else None
         timed_out = False
+        last_progress = 0.0
         while proc.poll() is None:
+            if self._stop.is_set() and cfg.batch_keep_running_on_restart:
+                return  # shutdown: Jasna runs on, the record stays "running" with its pid; adopted next start
             if deadline and time.monotonic() > deadline:
                 timed_out = True
                 log.warning("job %s: over batch.job_timeout_h (%.1fh), killing", job.id, cfg.batch_job_timeout_h)
                 self._kill(proc)
                 break
-            time.sleep(1.0)
+            if time.monotonic() - last_progress >= self.PROGRESS_POLL_S:
+                last_progress = time.monotonic()
+                self._update_progress(job)
+            time.sleep(0.5)
         proc.wait()
         with self.lock:
             self.proc = None
@@ -419,14 +451,22 @@ class JobQueue:
         if timed_out:
             self._discard(out_tmp)
             return self._finish(job, "failed", f"killed after batch.job_timeout_h ({cfg.batch_job_timeout_h}h)")
-        if self._stop.is_set():
-            return  # shutdown: left as "running" on disk, re-queued at the next start
+        if self._stop.is_set() and not cfg.batch_keep_running_on_restart:
+            return  # shutdown killed it: left as "running" on disk, re-queued at the next start
         if proc.returncode != 0:
             self._discard(out_tmp)
             return self._finish(job, "failed", f"Jasna exited with code {proc.returncode} (see the job log)")
+        self._finalize_output(job, out_tmp)
+
+    PROGRESS_POLL_S = 3.0
+
+    def _finalize_output(self, job: Job, out_tmp: str) -> None:
+        """Jasna is gone without being killed: move a complete output into
+        place, or fail the job."""
+        self._update_progress(job)
         if not os.path.isfile(out_tmp) or os.path.getsize(out_tmp) == 0:
             self._discard(out_tmp)
-            return self._finish(job, "failed", "Jasna exited 0 but wrote no output file")
+            return self._finish(job, "failed", "Jasna exited but wrote no output file")
         job.output_bytes = os.path.getsize(out_tmp)
         if os.path.exists(job.output):
             # The plugin checks this before submitting; a file appearing
@@ -444,6 +484,95 @@ class JobQueue:
         if not moved:
             return self._finish(job, "failed", f"output copy to {job.output} came up short; result left at {out_tmp}")
         self._finish(job, "done", "")
+
+    def _adopt_running(self, job: Job, pid: int) -> None:
+        """Watch a Jasna left running by the previous bridge until it exits,
+        then finish the job from its output file (the exit code of a
+        process that is not our child cannot be read)."""
+        out_tmp = os.path.join(self.scratch_dir, f"{job.id}{OUTPUT_EXT}")
+        work = os.path.join(self.scratch_dir, f"work-{job.id}")
+        while not self.sessions.batch_acquire(job.brief(), 0.0):
+            if self._stop.wait(1.0):
+                return
+        log.info("job %s: adopted running Jasna pid %s", job.id, pid)
+        with self.lock:
+            self.current = job
+        self._save()
+        try:
+            last_progress = 0.0
+            while self._is_job_process(pid, job):
+                if self._stop.is_set():
+                    return  # another restart: still running, adopted again next time
+                if job.id in self._cancel_requested:
+                    log.info("job %s: cancel requested on an adopted job, killing pid %s", job.id, pid)
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(pid, sig)
+                        except ProcessLookupError:
+                            break
+                        if not self._is_job_process(pid, job):
+                            break
+                        time.sleep(5)
+                    break
+                if time.monotonic() - last_progress >= self.PROGRESS_POLL_S:
+                    last_progress = time.monotonic()
+                    self._update_progress(job)
+                time.sleep(1.0)
+            with self.lock:
+                cancelled = job.id in self._cancel_requested
+                self._cancel_requested.discard(job.id)
+            shutil.rmtree(work, ignore_errors=True)
+            if cancelled:
+                self._discard(out_tmp)
+                return self._finish(job, "cancelled", "cancelled while running (adopted)")
+            job.notes.append("finished under a restarted bridge; exit code unknown, judged by the output file")
+            self._finalize_output(job, out_tmp)
+        except Exception as err:
+            log.exception("job %s: error while adopted", job.id)
+            self._finish(job, "failed", f"bridge error while adopted: {err}")
+        finally:
+            self.sessions.batch_release()
+
+    def _is_job_process(self, pid: int, job: Job) -> bool:
+        """True if `pid` is alive and is this job's Jasna (its command line
+        names the job's scratch output), so a reused pid is not mistaken."""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            return False
+        out_tmp = os.path.join(self.scratch_dir, f"{job.id}{OUTPUT_EXT}").encode()
+        return out_tmp in argv
+
+    def _find_job_pid(self, job: Job) -> int | None:
+        """The pid of a Jasna writing this job's scratch output, if one is
+        running (a record from an older bridge may lack the pid)."""
+        try:
+            pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+        except OSError:
+            return None
+        for pid in pids:
+            if self._is_job_process(pid, job):
+                return pid
+        return None
+
+    def _update_progress(self, job: Job) -> None:
+        """Read Jasna's latest progress-bar line from the job log."""
+        if not job.log_file:
+            return
+        try:
+            size = os.path.getsize(job.log_file)
+            with open(job.log_file, "rb") as fh:
+                if size > 16384:
+                    fh.seek(size - 16384)
+                tail = fh.read().decode(errors="replace")
+        except OSError:
+            return
+        parsed = parse_progress(tail)
+        if parsed is not None:
+            parsed["updated"] = time.time()
+            with self.lock:
+                job.progress = parsed
 
     def _preflight(self, job: Job, out_tmp: str) -> str:
         cfg = self.cfg
@@ -526,6 +655,33 @@ class JobQueue:
                 return
             except subprocess.TimeoutExpired:
                 continue
+
+
+_PERCENT_RE = re.compile(r"(\d{1,3})%")
+_ETA_RE = re.compile(r"<\s*(\d+):(\d{2})(?::(\d{2}))?")
+_RATE_RE = re.compile(r"([\d.]+)\s*(frames?/s|fps|it/s|s/it)")
+
+
+def parse_progress(text: str) -> dict | None:
+    """The last progress-bar update in a chunk of Jasna's output. tqdm
+    rewrites its line with carriage returns, so the chunk is split on both
+    CR and LF and the last piece with a percentage wins. Returns
+    {"percent", "eta_s", "rate", "detail"} or None when there is none."""
+    for piece in reversed(re.split(r"[\r\n]+", text)):
+        m = _PERCENT_RE.search(piece)
+        if not m or "%" not in piece:
+            continue
+        percent = min(100, int(m.group(1)))
+        eta = _ETA_RE.search(piece)
+        eta_s = None
+        if eta:
+            h, mnt, sec = eta.groups()
+            eta_s = (int(h) * 3600 + int(mnt) * 60 + int(sec)) if sec is not None else (int(h) * 60 + int(mnt))
+        rate = _RATE_RE.search(piece)
+        detail = piece[m.end():].strip(" |,")
+        return {"percent": percent, "eta_s": eta_s, "rate": rate.group(0) if rate else None,
+                "detail": detail[:120]}
+    return None
 
 
 def _activation_file() -> str | None:

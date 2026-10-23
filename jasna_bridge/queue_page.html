@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jasna queue</title>
+<meta name="color-scheme" content="light dark">
+<style>
+  :root {
+    --bg: #f4f5f8; --card: #ffffff; --text: #1b1d23; --muted: #6b7180; --line: #e2e5ec;
+    --accent: #7c5cff; --ok: #1f9d55; --warn: #d9831f; --bad: #d64545; --run: #2f7de1;
+    --chip: #eef0f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15161b; --card: #1f2128; --text: #e8e9ee; --muted: #9a9fae; --line: #2d303a;
+      --accent: #bd93f9; --ok: #50fa7b; --warn: #ffb86c; --bad: #ff5555; --run: #8be9fd;
+      --chip: #2a2d37;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 16px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; margin-bottom: 14px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 22px 0 8px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    background: var(--chip); color: var(--muted); white-space: nowrap; }
+  .pill.ok { color: var(--ok); } .pill.run { color: var(--run); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; }
+  .row { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; align-items: center; }
+  .pos { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 1.6em; text-align: right; }
+  .title { font-weight: 600; overflow-wrap: anywhere; }
+  .title a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+  .sub { grid-column: 2 / 4; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .sub b { color: var(--text); font-weight: 600; }
+  .err { grid-column: 2 / 4; color: var(--bad); font-size: 13px; overflow-wrap: anywhere; }
+  button { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--chip); color: var(--text); cursor: pointer; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  a.log { color: var(--muted); font-size: 13px; }
+  .running .card { border-color: var(--run); }
+  .bar { height: 4px; border-radius: 2px; background: var(--chip); overflow: hidden; margin-top: 8px; grid-column: 1 / 4; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--run); transition: width .6s ease; }
+  .bar.unknown { background: repeating-linear-gradient(90deg, var(--chip) 0 6px, var(--line) 6px 12px); }
+  .sub.prog { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 6px 2px; }
+  .foot { margin-top: 24px; font-size: 12px; color: var(--muted); }
+  .foot a { color: inherit; }
+  @media (max-width: 480px) { .row { grid-template-columns: auto 1fr; } .row > button, .row > a.log { grid-column: 2; justify-self: start; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Jasna queue</h1>
+    <span id="status" class="pill">loading</span>
+    <span id="meta" class="meta"></span>
+  </header>
+
+  <section class="running">
+    <h2>Running</h2>
+    <div id="running"></div>
+  </section>
+
+  <section>
+    <h2>Queued <span id="qcount" class="meta"></span></h2>
+    <div id="queued"></div>
+  </section>
+
+  <section>
+    <h2>Finished <span id="fcount" class="meta"></span></h2>
+    <div id="finished"></div>
+  </section>
+
+  <p class="foot">stash-jasna-bridge <span id="version"></span> · refreshes every 5 s · <a href="jobs">raw JSON</a> · <a href="health">health</a></p>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const titles = {};            // scene id -> Stash title (from Stash GraphQL, same origin)
+  let titlesWanted = new Set();
+
+  const fmtDur = (s) => {
+    if (s == null) return "";
+    s = Math.round(s);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m ${String(r).padStart(2, "0")}s` : `${r}s`;
+  };
+  const fmtTime = (epoch) => {
+    if (!epoch) return "";
+    const d = new Date(epoch * 1000), now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                   : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  };
+  const fmtGB = (b) => (b ? (b / 1e9).toFixed(2) + " GB" : "");
+  const base = (j) => (j.stash_source || "").split("/").pop();
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function sceneLink(j) {
+    const t = titles[j.scene_id];
+    const label = t ? esc(t) : esc(base(j));
+    return `<a href="/scenes/${encodeURIComponent(j.scene_id)}" title="scene ${esc(j.scene_id)}">${label}</a>`;
+  }
+
+  async function api(path, opts) {
+    const r = await fetch(path, { credentials: "include", ...opts });
+    if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async function cancel(id, state) {
+    const what = state === "running" ? "Stop the running job and discard its progress?" : "Remove this job from the queue?";
+    if (!confirm(what)) return;
+    try { await api(`jobs/${id}`, { method: "DELETE" }); } catch (e) { alert(e.message); }
+    refresh();
+  }
+  window.__cancel = cancel;
+
+  function progressBar(j) {
+    const p = j.progress;
+    if (!p || p.percent == null) return '<span class="bar unknown"></span><span class="sub prog">progress not reported yet</span>';
+    const bits = [`${p.percent}%`];
+    if (p.eta_s != null) bits.push(`ETA ${fmtDur(p.eta_s)}`);
+    if (p.rate) bits.push(p.rate);
+    return `<span class="bar"><i style="width:${p.percent}%"></i></span>
+      <span class="sub prog">${esc(bits.join(" · "))}</span>`;
+  }
+
+  function renderJob(j, pos) {
+    const st = j.state;
+    const when = st === "running" ? `started ${fmtTime(j.started)} · running ${fmtDur(j.running_s)}`
+               : st === "queued" ? `queued ${fmtTime(j.created)}`
+               : `${fmtTime(j.finished)} · ${fmtDur(j.duration_s)}${j.output_bytes ? " · " + fmtGB(j.output_bytes) : ""}`;
+    const cls = st === "done" ? "ok" : st === "running" ? "run" : st === "queued" ? "" : st === "failed" ? "bad" : "warn";
+    const action = (st === "queued" || st === "running")
+      ? `<button class="danger" onclick="__cancel('${j.id}','${st}')">${st === "running" ? "Stop" : "Remove"}</button>`
+      : (j.log_file ? `<a class="log" href="jobs/${j.id}/log" target="_blank">log</a>` : "");
+    return `<div class="card"><div class="row">
+      <span class="pos">${pos != null ? pos : `<span class="pill ${cls}">${esc(st)}</span>`}</span>
+      <span class="title">${sceneLink(j)}</span>
+      ${action}
+      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}</span>
+      ${j.error ? `<span class="err">${esc(j.error)}</span>` : ""}
+      ${st === "running" ? progressBar(j) : ""}
+    </div></div>`;
+  }
+
+  async function loadTitles(ids) {
+    const missing = ids.filter((id) => !(id in titles));
+    if (!missing.length) return;
+    try {
+      const r = await fetch("/graphql", {
+        method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "query Q($ids:[ID!]) { findScenes(ids:$ids) { scenes { id title } } }", variables: { ids: missing } }),
+      });
+      const d = await r.json();
+      for (const s of (d.data && d.data.findScenes && d.data.findScenes.scenes) || []) titles[s.id] = s.title || "";
+      for (const id of missing) if (!(id in titles)) titles[id] = "";
+    } catch (e) { for (const id of missing) titles[id] = ""; }
+  }
+
+  async function refresh() {
+    try {
+      const [health, list, batchInfo] = await Promise.all([api("health"), api("jobs"), api("batch").catch(() => ({}))]);
+      const jobs = list.jobs || [];
+      const running = jobs.filter((j) => j.state === "running");
+      const queued = jobs.filter((j) => j.state === "queued");
+      const finished = jobs.filter((j) => !["running", "queued"].includes(j.state)).sort((a, b) => (b.finished || 0) - (a.finished || 0)).slice(0, 25);
+      await loadTitles(jobs.map((j) => j.scene_id));
+
+      const b = health.batch || {};
+      const live = health.active ? "live stream active" : (health.stream && health.stream.path) ? "stream lingering" : "";
+      const s = $("status");
+      if (!b.enabled) { s.textContent = "batch disabled"; s.className = "pill bad"; }
+      else if (running.length) { s.textContent = "processing"; s.className = "pill run"; }
+      else if (queued.length) { s.textContent = live ? `waiting: ${live}` : "waiting for the GPU"; s.className = "pill warn"; }
+      else { s.textContent = live || "idle"; s.className = "pill ok"; }
+      const meta = [];
+      if (batchInfo.jasna_version) meta.push(`Jasna ${batchInfo.jasna_version}`);
+      if (b.scratch_free_gb != null) meta.push(`${Math.round(b.scratch_free_gb)} GB scratch free`);
+      meta.push(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+      $("meta").textContent = meta.join(" · ");
+      $("version").textContent = health.version || "";
+
+      $("running").innerHTML = running.length ? running.map((j) => renderJob(j)).join("") : `<div class="empty">nothing running</div>`;
+      $("queued").innerHTML = queued.length ? queued.map((j, i) => renderJob(j, i + 1)).join("") : `<div class="empty">queue is empty</div>`;
+      $("qcount").textContent = queued.length ? `(${queued.length})` : "";
+      $("finished").innerHTML = finished.length ? finished.map((j) => renderJob(j)).join("") : `<div class="empty">none yet</div>`;
+      $("fcount").textContent = finished.length ? `(last ${finished.length})` : "";
+    } catch (e) {
+      $("status").textContent = "bridge unreachable"; $("status").className = "pill bad";
+      $("meta").textContent = e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+})();
+</script>
+</body>
+</html>

@@ -10,8 +10,10 @@
 #   systemctl --user enable --now stash-jasna-bridge
 #
 # Logs: journalctl --user -u stash-jasna-bridge -f
-# With jasna.manage_process = true, Jasna is a child of this unit and the GPU
-# is freed when the unit stops.
+# With jasna.manage_process = true, Jasna is a child of this unit; the bridge
+# stops the stream Jasna itself on shutdown. KillMode=process so a batch job's
+# Jasna is NOT killed by a restart of the bridge: the new bridge adopts it
+# (batch.keep_running_on_restart).
 [Unit]
 Description=Bridge between Stash jasna-switch and jasna --stream
 After=network-online.target
@@ -23,7 +25,7 @@ WorkingDirectory=%h/Projects/stash-jasna-bridge
 ExecStart=/usr/bin/python3 -m jasna_bridge -c %h/Projects/stash-jasna-bridge/bridge.toml
 Restart=on-failure
 RestartSec=5
-KillMode=mixed
+KillMode=process
 TimeoutStopSec=30
 
 [Install]

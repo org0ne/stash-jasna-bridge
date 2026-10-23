@@ -83,3 +83,6 @@ common_flags = []           # added to every job after jasna.common_flags, e.g. 
 output_roots = []           # Stash-side prefixes an output_path must be under, e.g. ["/media/Sorted/LTX"]; [] = any
 notify_plugin = "jasna-batch"  # Stash plugin + task run on every job state change, so the scene's
 notify_task = "Sync jobs"      #   status tag follows the job ("" turns the callback off)
+progress = true             # let Jasna print its progress bar into the job log; /jobs reports percent and ETA
+keep_running_on_restart = true  # a bridge restart leaves the running Jasna alone and adopts it afterwards
+                            #   (the unit must have KillMode=process, as deploy/stash-jasna-bridge.service does)

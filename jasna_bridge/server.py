@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -23,6 +24,9 @@ from .stash import CookieValidator, StashClient, StashError
 
 log = logging.getLogger("bridge.http")
 
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_page.html"), "rb") as _fh:
+    QUEUE_PAGE = _fh.read()
+
 TOKEN_RE = r"(?P<token>[A-Za-z0-9_-]{16,64})"
 JOB_RE = r"(?P<job_id>[0-9a-f]{12})"
 ROUTES = [
@@ -36,6 +40,7 @@ ROUTES = [
     ("GET", re.compile(rf"^/hls/{TOKEN_RE}/stream\.m3u8$"), "playlist", False),
     ("GET", re.compile(rf"^/hls/{TOKEN_RE}/(?P<seg>seg_[0-9]{{5}}\.ts)$"), "segment", False),
     # Batch jobs (jobs.py), used by the Stash jasna-batch plugin.
+    ("GET", re.compile(r"^/queue$"), "queue_page", True),
     ("GET", re.compile(r"^/batch$"), "batch", True),
     ("GET", re.compile(r"^/batch/check$"), "batch_check", True),
     ("GET", re.compile(r"^/jobs$"), "jobs_list", True),
@@ -215,6 +220,14 @@ class Handler(BaseHTTPRequestHandler):
         if jobs is None:
             raise JobError("batch jobs are disabled on this bridge (batch.enabled = false)", HTTPStatus.NOT_FOUND)
         return jobs
+
+    def h_queue_page(self):
+        """The queue as a page for a phone or desktop browser: polls
+        ./health and ./jobs (relative, so any path_prefix works), names
+        scenes through Stash's GraphQL on the same origin, cancels with
+        DELETE ./jobs/{id}."""
+        self.jobs_or_404()
+        self.send(HTTPStatus.OK, QUEUE_PAGE, "text/html; charset=utf-8")
 
     def h_batch(self):
         jobs = self.jobs_or_404()

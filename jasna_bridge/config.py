@@ -108,6 +108,9 @@ class Config:
     batch_notify_task: str = "Sync jobs"       # ("" disables the callback; the plugin's own Sync task sweeps instead)
     batch_keep_jobs: int = 200       # finished jobs kept in the state file (oldest acknowledged ones dropped first)
     batch_max_attempts: int = 2      # a job interrupted by a bridge restart is re-queued this many times
+    batch_progress: bool = True      # let Jasna print its progress bar into the job log and report percent/ETA
+    batch_keep_running_on_restart: bool = True  # a bridge stop leaves the running Jasna alone; the next bridge
+                                     # start adopts it (needs KillMode=process in the unit)
 
     def preset(self, name: str) -> Preset:
         """Configured preset or a registered custom one; KeyError if neither."""
@@ -258,6 +261,8 @@ def from_dict(data: dict) -> Config:
     cfg.batch_notify_task = _get(batch, "notify_task", cfg.batch_notify_task)
     cfg.batch_keep_jobs = _get(batch, "keep_jobs", cfg.batch_keep_jobs)
     cfg.batch_max_attempts = _get(batch, "max_attempts", cfg.batch_max_attempts)
+    cfg.batch_progress = _get(batch, "progress", cfg.batch_progress)
+    cfg.batch_keep_running_on_restart = _get(batch, "keep_running_on_restart", cfg.batch_keep_running_on_restart)
     if cfg.batch_enabled and not cfg.manage_process:
         raise ValueError("batch.enabled = true requires jasna.manage_process = true (and jasna.binary)")
     for f in cfg.batch_common_flags:

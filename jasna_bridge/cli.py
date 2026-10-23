@@ -137,7 +137,7 @@ WorkingDirectory={REPO_DIR}
 ExecStart={sys.executable} -m jasna_bridge -c {REPO_DIR}/bridge.toml
 Restart=on-failure
 RestartSec=5
-KillMode=mixed
+KillMode=process
 TimeoutStopSec=30
 
 [Install]

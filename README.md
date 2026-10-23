@@ -82,6 +82,7 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | POST | `/jobs/{id}/ack` | the plugin has ingested the result |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
 | GET | `/batch`, `/batch/check` | queue snapshot / environment checks for the plugin's *Check settings* task |
+| GET | `/queue` | the queue as a page for a phone or desktop browser: running job, queued jobs with Remove, last finished ones with their log; refreshes every 5s |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
 through Stash GraphQL (`findScene { files { path } }`) and applies the
@@ -254,6 +255,19 @@ optional `[[paths.map]]` rewrites.
   naming a model that is not downloaded fails at Jasna's download prompt,
   which `GET /batch/check` (and the plugin's *Check settings*) warns about
   for LTX.
+- **Progress and restarts.** Jobs run with Jasna's progress bar on
+  (`batch.progress`); the bridge reads its last update from the job log
+  every 3s and reports `progress: {percent, eta_s, rate}` on the job, which
+  the `/queue` page draws as a bar. A bridge restart does not lose a
+  running job: with `batch.keep_running_on_restart` (default) the bridge
+  leaves Jasna running on shutdown and the next bridge adopts it by pid
+  (found through `/proc` when the record has none), holds the GPU for it,
+  and finishes from the output file when it exits (the exit code of a
+  process that is not a child cannot be read, so the job notes say so).
+  This needs `KillMode=process` in the unit, as
+  `deploy/stash-jasna-bridge.service` and `install` write it; with
+  `KillMode=mixed` systemd kills Jasna with the bridge and the job is
+  re-queued instead.
 - **Auth.** `none`, `token` (Authorization: Bearer / X-Bridge-Token on
   `/session`, `/presets`), or `stash_cookie` (the browser's Stash cookie is
   forwarded to Stash GraphQL and cached for `cache_s`). Token-in-path

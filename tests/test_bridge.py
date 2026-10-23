@@ -1330,7 +1330,7 @@ class Batch(unittest.TestCase):
         self.assertGreater(job["duration_s"], 0)
         self.assertEqual(job["exit_code"], 0)
         self.assertEqual(job["jasna_version"], "0.10.0")  # probed from the fake's --version
-        self.assertIn("--input", job["command"]); self.assertIn("--no-progress", job["command"])
+        self.assertIn("--input", job["command"]); self.assertNotIn("--no-progress", job["command"])
         self.assertEqual(job["command"][job["command"].index("--input") + 1], self.src)
         self.assertFalse(job["ingested"])
         st, text, hdr = self.h.call("GET", f"/jobs/{job['id']}/log")
@@ -1437,6 +1437,80 @@ class Batch(unittest.TestCase):
         st, body, _ = self.h.call("GET", "/jobs/0123456789ab")
         self.assertEqual(st, 404)
 
+    def test_progress_is_parsed_from_the_log(self):
+        from jasna_bridge.jobs import parse_progress
+        self.assertIsNone(parse_progress("Jasna: checking the installation\n11:17:20 jasna.vr180 INFO: VR mode"))
+        p = parse_progress("x\rProcessing Files: |###       |  30%  00:12<00:28, 2.5frames/s\rProcessing Files: |#####     |  50%  01:02:03<02:00:30, 8.3frames/s")
+        self.assertEqual(p["percent"], 50)
+        self.assertEqual(p["eta_s"], 2 * 3600 + 30)
+        self.assertEqual(p["rate"], "8.3frames/s")
+        # a job run with the progress bar on reports percent while running
+        st, body, _ = self.submit(flags=["--fake-delay", "3"])
+        job_id = body["job"]["id"]
+        seen = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            st, body, _ = self.h.call("GET", f"/jobs/{job_id}")
+            if body["job"]["progress"] and body["job"]["progress"]["percent"] is not None:
+                seen = body["job"]["progress"]
+            if body["job"]["state"] != "running" and seen:
+                break
+            time.sleep(0.3)
+        self.assertIsNotNone(seen, "no progress reported")
+        self.assertIn("frames/s", seen["rate"])
+        job = self.wait_state(job_id, {"done"})
+        self.assertEqual(job["progress"]["percent"], 100)
+        self.assertNotIn("--no-progress", job["command"])
+
+    def test_running_job_survives_a_bridge_restart(self):
+        st, body, _ = self.submit(flags=["--fake-delay", "4"])
+        job_id = body["job"]["id"]
+        pid = None
+        deadline = time.time() + 15
+        while time.time() < deadline and not pid:
+            st, body, _ = self.h.call("GET", f"/jobs/{job_id}")
+            pid = body["job"]["pid"]
+            time.sleep(0.1)
+        self.assertTrue(pid)
+        self.h.jobs.shutdown()           # keep_running_on_restart (default): Jasna is left alone
+        self.assertTrue(os.path.exists(f"/proc/{pid}"))
+        self.h.sessions.batch_release()  # the old bridge is gone; its GPU claim with it
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, StashClient(self.h.cfg.stash_url),
+                            lambda p: config.map_path(self.h.cfg, p))
+        reloaded.POLL_S = 0.2
+        reloaded.start()
+        try:
+            self.assertEqual(reloaded.jobs[job_id].state, "running")
+            self.assertIn("adopted", reloaded.jobs[job_id].notes[0])
+            st, busy, _ = self.h.call("POST", "/session", {"scene_id": "1"})
+            self.assertEqual(st, 409); self.assertEqual(busy["reason"], "batch")  # still holds the GPU
+            deadline = time.time() + 15
+            while time.time() < deadline and reloaded.jobs[job_id].state == "running":
+                time.sleep(0.2)
+            job = reloaded.jobs[job_id]
+            self.assertEqual(job.state, "done", job.error)
+            self.assertTrue(os.path.exists(self.out))
+            self.assertIn("exit code unknown", job.notes[-1])
+            self.assertEqual(job.progress["percent"], 100)
+            self.assertIsNone(self.h.sessions.batch_job)
+        finally:
+            reloaded.shutdown()
+            self.h.jobs = None
+
+    def test_queue_page(self):
+        st, body, hdr = self.h.call("GET", "/queue")
+        self.assertEqual(st, 200)
+        self.assertIn("text/html", hdr["Content-Type"])
+        self.assertIn(b"Jasna queue", body)
+        self.assertIn(b'fetch("/graphql"', body)       # scene titles from Stash on the same origin
+        self.assertIn(b'api("jobs")', body)             # relative, so the path prefix does not matter
+        plain = BridgeHarness()
+        try:
+            st, body, _ = plain.call("GET", "/queue")
+            self.assertEqual(st, 404)
+        finally:
+            plain.close()
+
     def test_disabled_bridge_answers_404(self):
         plain = BridgeHarness()
         try:
@@ -1461,8 +1535,15 @@ class Batch(unittest.TestCase):
     def test_interrupted_job_is_requeued_on_restart(self):
         st, body, _ = self.submit(flags=["--fake-delay", "5"])
         job_id = body["job"]["id"]
-        self.wait_state(job_id, {"running"})
-        self.h.jobs.shutdown()   # like a bridge restart mid-job: Jasna killed, record left "running"
+        pid = None
+        deadline = time.time() + 15
+        while time.time() < deadline and not pid:
+            st, body, _ = self.h.call("GET", f"/jobs/{job_id}")
+            pid = body["job"]["pid"]
+            time.sleep(0.1)
+        self.h.jobs.shutdown()   # a bridge restart leaves Jasna running...
+        os.kill(pid, 9)          # ...but here the machine rebooted: the process is gone
+        time.sleep(0.5)
         with open(self.h.jobs.state_file) as fh:
             self.assertEqual(json.load(fh)["jobs"][0]["state"], "running")
         reloaded = JobQueue(self.h.cfg, self.h.sessions, None, lambda p: p)

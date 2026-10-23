@@ -251,7 +251,19 @@ if __name__ == "__main__":
         # with --fake-fail's code, or exit 0 without writing (--fake-no-output).
         def opt(name, default=None):
             return args[args.index(name) + 1] if name in args else default
-        time.sleep(float(opt("--fake-delay", 0)))
+        delay = float(opt("--fake-delay", 0))
+        if "--no-progress" in args or delay <= 0:
+            time.sleep(delay)
+        else:
+            # Like Jasna's tqdm bar: the line is rewritten with carriage returns.
+            steps = 4
+            for i in range(1, steps + 1):
+                time.sleep(delay / steps)
+                pct = int(100 * i / steps)
+                left = delay - delay * i / steps
+                sys.stderr.write(f"\rProcessing Files: |{'#' * (pct // 10):<10}| {pct:3d}%  00:0{int(delay - left)}<00:0{int(left)}, 2.5frames/s")
+                sys.stderr.flush()
+            sys.stderr.write("\n")
         if "--fake-fail" in args:
             print("fake jasna: failing on request", file=sys.stderr)
             sys.exit(int(opt("--fake-fail", 3)))

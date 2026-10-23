@@ -1340,7 +1340,13 @@ class Batch(unittest.TestCase):
         st, text, hdr = self.h.call("GET", f"/jobs/{job['id']}/log")
         self.assertEqual(st, 200); self.assertIn(b"fake jasna: done", text)
         self.assertIn("text/plain", hdr["Content-Type"])
-        events = [t["args"]["event"] for t in self.tasks_seen() if t["args"].get("job_id") == job["id"]]
+        # the "done" task is sent just after the state flips, so allow it a moment
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            events = [t["args"]["event"] for t in self.tasks_seen() if t["args"].get("job_id") == job["id"]]
+            if "done" in events:
+                break
+            time.sleep(0.05)
         self.assertEqual(events, ["started", "done"])
         self.assertEqual(self.tasks_seen()[0]["plugin_id"], "jasna-batch")
         self.assertEqual(self.tasks_seen()[0]["task_name"], "Sync jobs")
@@ -1351,8 +1357,12 @@ class Batch(unittest.TestCase):
         self.assertEqual([j["id"] for j in body["jobs"]], [job["id"]])
         st, body, _ = self.h.call("POST", f"/jobs/{job['id']}/ack")
         self.assertEqual(st, 200); self.assertTrue(body["job"]["ingested"])
+        self.assertIsNone(body["job"]["result_scene_id"])
         st, body, _ = self.h.call("GET", "/jobs?unacknowledged=1")
         self.assertEqual(body["count"], 0)
+        # acking again with the new scene's id is allowed and records it
+        st, body, _ = self.h.call("POST", f"/jobs/{job['id']}/ack", {"scene_id": "77"})
+        self.assertEqual(st, 200); self.assertEqual(body["job"]["result_scene_id"], "77")
         st, body, _ = self.h.call("GET", "/health")
         self.assertEqual(body["batch"]["stats"]["completed"], 1)
         self.assertIsNone(body["batch"]["running"]); self.assertIsNone(body["batch_job"])
@@ -1520,6 +1530,7 @@ class Batch(unittest.TestCase):
         self.assertIn(b'fetch("/graphql"', body)       # scene titles from Stash on the same origin
         self.assertIn(b'findScene(id:', body)           # one alias per scene: a deleted scene must not blank the rest
         self.assertIn(b'Pass ${cur} of ${total}', body)  # the running job says which pass it is in
+        self.assertIn(b'j.result_scene_id', body)        # a done job links to the scene made from its output
         self.assertIn(b'api("jobs")', body)             # relative, so the path prefix does not matter
         plain = BridgeHarness()
         try:

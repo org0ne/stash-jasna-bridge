@@ -71,6 +71,7 @@ class Job:
     log_file: str = ""
     attempts: int = 0
     ingested: bool = False   # the plugin acknowledged it (copied sidecars, scanned, ...)
+    result_scene_id: str | None = None   # the Stash scene made from the output, as the plugin reported it on ack
     notes: list[str] = field(default_factory=list)
     pid: int | None = None   # Jasna's pid while running (so a restarted bridge can adopt it)
     # Parsed from Jasna's progress bar in the log: {"percent", "eta_s", "rate", "detail", "updated"}
@@ -278,7 +279,10 @@ class JobQueue:
                 return job
             raise JobError(f"job is already {job.state}", 409)
 
-    def ack(self, job_id: str) -> Job:
+    def ack(self, job_id: str, result_scene_id: str | None = None) -> Job:
+        """The plugin has dealt with a finished job; result_scene_id is the
+        new Stash scene when it made one. Repeating an ack is fine (it can
+        add the scene id later)."""
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None:
@@ -286,6 +290,8 @@ class JobQueue:
             if job.state in ACTIVE:
                 raise JobError(f"job is still {job.state}", 409)
             job.ingested = True
+            if result_scene_id:
+                job.result_scene_id = str(result_scene_id)
         self._save()
         return job
 

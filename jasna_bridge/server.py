@@ -279,7 +279,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.OK, {"job": job.public(), "cancelling": job.state in JOB_ACTIVE})
 
     def h_job_ack(self, job_id: str):
-        job = self.jobs_or_404().ack(job_id)
+        body = self.read_json()   # optional {"scene_id": "<new Stash scene>"}
+        job = self.jobs_or_404().ack(job_id, body.get("scene_id"))
         self.send_json(HTTPStatus.OK, {"job": job.public()})
 
     def h_job_log(self, job_id: str):

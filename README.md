@@ -79,7 +79,7 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | POST | `/jobs` | `{scene_id, file_path, output_path, preset, flags}` → **201** `{job, position}`; **409** when the same file+preset is already queued or running; **403** outside `batch.output_roots`. Batch jobs, see below |
 | GET | `/jobs[?state=queued,running&unacknowledged=1]` | job list |
 | GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
-| POST | `/jobs/{id}/ack` | the plugin has ingested the result |
+| POST | `/jobs/{id}/ack` | the plugin has ingested the result; optional body `{"scene_id"}` = the Stash scene made from the output (`result_scene_id`, which the queue page links a done job to) |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
 | GET | `/batch`, `/batch/check` | queue snapshot / environment checks for the plugin's *Check settings* task |
 | GET | `/queue` | the queue as a page for a phone or desktop browser: GPU load sparkline, running job, queued jobs with Remove and each source's duration, last finished ones with their log; refreshes every 5s |

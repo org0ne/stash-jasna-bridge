@@ -65,6 +65,27 @@ class StashClient:
             raise StashError(f"scene {scene_id} has no files")
         return files[0]["path"], files[0].get("duration")
 
+    def scene_files(self, scene_id: str) -> list[str]:
+        """Every file path of the scene (a multi-file scene has several)."""
+        data = self.graphql(
+            "query BridgeSceneFiles($id: ID!) { findScene(id: $id) { id files { path } } }",
+            {"id": str(scene_id)},
+        )
+        scene = data.get("findScene")
+        if not scene:
+            raise StashError(f"scene {scene_id} not found")
+        return [f["path"] for f in scene.get("files") or [] if f.get("path")]
+
+    def run_plugin_task(self, plugin_id: str, task_name: str, args: dict | None = None) -> str:
+        """Queue a plugin task in Stash (used to tell the jasna-batch plugin
+        a job changed state). Returns Stash's job id."""
+        data = self.graphql(
+            "mutation BridgeRunTask($plugin_id: ID!, $task_name: String!, $args_map: Map) "
+            "{ runPluginTask(plugin_id: $plugin_id, task_name: $task_name, args_map: $args_map) }",
+            {"plugin_id": plugin_id, "task_name": task_name, "args_map": args or {}},
+        )
+        return str(data.get("runPluginTask") or "")
+
 
 class CookieValidator:
     """Validates a browser's Stash session cookie by making an authenticated

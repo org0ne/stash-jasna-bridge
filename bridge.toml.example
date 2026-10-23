@@ -70,3 +70,16 @@ version = ""                # part of the cache key; default parsed from the jas
                             # (e.g. ".../jasna-linux-nvidia-0.10.0/jasna" -> "0.10.0"), else "v0".
                             # Set it by hand when manage_process = false, and bump it after a
                             # Jasna upgrade so old restorations are not replayed.
+
+[batch]                     # offline jobs queued by the Stash jasna-batch plugin (jasna --input/--output)
+enabled = false             # needs jasna.manage_process = true. One job at a time, on the stream's GPU:
+                            #   a running job holds the GPU and POST /session answers 409 {"reason": "batch"}
+scratch_dir = ""            # local disk Jasna writes to; default ~/.cache/stash-jasna-bridge/batch. The finished
+                            #   file is moved to the job's output path (a NAS share, typically) when Jasna exits 0
+min_free_gb = 20            # a job is refused when scratch or the output volume has less than this free
+grace_s = 120               # wait this long after the last live session ends before a job takes the GPU
+job_timeout_h = 0           # kill a job running longer than this; 0 = no limit (LTX presets can take many hours)
+common_flags = []           # added to every job after jasna.common_flags, e.g. ["--retarget-high-fps"]
+output_roots = []           # Stash-side prefixes an output_path must be under, e.g. ["/media/Sorted/LTX"]; [] = any
+notify_plugin = "jasna-batch"  # Stash plugin + task run on every job state change, so the scene's
+notify_task = "Sync jobs"      #   status tag follows the job ("" turns the callback off)

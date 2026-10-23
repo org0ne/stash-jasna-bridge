@@ -90,6 +90,25 @@ class Config:
     cache_max_gb: float = 5.0
     cache_version: str = ""      # cache-key salt; default: parsed from jasna.binary path, else "v0"
 
+    # [batch]: offline `jasna --input --output` jobs queued by the Stash
+    # jasna-batch plugin. One job at a time, on the same GPU as the stream,
+    # so a running job holds the GPU and POST /session answers 409 "batch"
+    # until it is done. Needs manage_process (the binary path, and the
+    # stream process must be stoppable to free VRAM).
+    batch_enabled: bool = False
+    batch_scratch_dir: str = ""      # default: ~/.cache/stash-jasna-bridge/batch; Jasna writes here, the
+                                     # finished file is then moved to the job's output path
+    batch_state_file: str = ""       # default: <scratch_dir>/jobs.json
+    batch_min_free_gb: float = 20.0  # refuse to start a job with less free space on scratch or the output volume
+    batch_grace_s: float = 120.0     # wait this long after the last live session ends before taking the GPU
+    batch_job_timeout_h: float = 0.0 # kill a job running longer than this; 0 = no limit
+    batch_common_flags: list[str] = field(default_factory=list)  # added to every batch run after jasna.common_flags
+    batch_output_roots: list[str] = field(default_factory=list)  # Stash-side prefixes an output path must be under; [] = any
+    batch_notify_plugin: str = "jasna-batch"   # Stash plugin whose task is run on every job state change
+    batch_notify_task: str = "Sync jobs"       # ("" disables the callback; the plugin's own Sync task sweeps instead)
+    batch_keep_jobs: int = 200       # finished jobs kept in the state file (oldest acknowledged ones dropped first)
+    batch_max_attempts: int = 2      # a job interrupted by a bridge restart is re-queued this many times
+
     def preset(self, name: str) -> Preset:
         """Configured preset or a registered custom one; KeyError if neither."""
         try:
@@ -142,6 +161,14 @@ def validate_custom_preset(name, flags) -> Preset:
     if not out[0].startswith("-"):
         raise ValueError(f"custom preset flags must start with a flag, not {out[0]!r}")
     return Preset(name, out, "custom")
+
+
+def map_path(cfg: Config, path: str) -> str:
+    """A Stash-side path as Jasna sees it ([[paths.map]], first match wins)."""
+    for stash_root, jasna_root in cfg.path_map:
+        if path.startswith(stash_root):
+            return jasna_root + path[len(stash_root):]
+    return path
 
 
 def _get(table: dict, key: str, default):
@@ -217,6 +244,26 @@ def from_dict(data: dict) -> Config:
     cfg.cache_dir = _get(cache, "dir", cfg.cache_dir)
     cfg.cache_max_gb = _get(cache, "max_gb", cfg.cache_max_gb)
     cfg.cache_version = _get(cache, "version", cfg.cache_version)
+
+    batch = data.get("batch", {})
+    cfg.batch_enabled = _get(batch, "enabled", cfg.batch_enabled)
+    cfg.batch_scratch_dir = _get(batch, "scratch_dir", cfg.batch_scratch_dir)
+    cfg.batch_state_file = _get(batch, "state_file", cfg.batch_state_file)
+    cfg.batch_min_free_gb = _get(batch, "min_free_gb", cfg.batch_min_free_gb)
+    cfg.batch_grace_s = _get(batch, "grace_s", cfg.batch_grace_s)
+    cfg.batch_job_timeout_h = _get(batch, "job_timeout_h", cfg.batch_job_timeout_h)
+    cfg.batch_common_flags = list(_get(batch, "common_flags", []))
+    cfg.batch_output_roots = [str(r).rstrip("/") for r in _get(batch, "output_roots", []) if str(r).strip()]
+    cfg.batch_notify_plugin = _get(batch, "notify_plugin", cfg.batch_notify_plugin)
+    cfg.batch_notify_task = _get(batch, "notify_task", cfg.batch_notify_task)
+    cfg.batch_keep_jobs = _get(batch, "keep_jobs", cfg.batch_keep_jobs)
+    cfg.batch_max_attempts = _get(batch, "max_attempts", cfg.batch_max_attempts)
+    if cfg.batch_enabled and not cfg.manage_process:
+        raise ValueError("batch.enabled = true requires jasna.manage_process = true (and jasna.binary)")
+    for f in cfg.batch_common_flags:
+        head = f.split("=", 1)[0] if f.startswith("-") else ""
+        if head in CUSTOM_FLAG_DENYLIST:
+            raise ValueError(f"batch.common_flags may not contain {head} (the bridge sets input/output itself)")
 
     if cfg.manage_process and not cfg.jasna_binary:
         raise ValueError("jasna.manage_process = true requires jasna.binary")

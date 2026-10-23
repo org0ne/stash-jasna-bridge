@@ -39,7 +39,16 @@ def start(require_cookie: str | None = None) -> tuple[ThreadingHTTPServer, list]
                 sid = str(req["variables"]["id"])
                 if sid not in SCENES:
                     return self.reply(200, {"data": {"findScene": None}})
-                return self.reply(200, {"data": {"findScene": {"id": sid, "files": [{"path": SCENES[sid], "duration": 40.0}]}}})
+                paths = SCENES[sid] if isinstance(SCENES[sid], list) else [SCENES[sid]]
+                return self.reply(200, {"data": {"findScene": {
+                    "id": sid, "files": [{"path": p, "duration": 40.0} for p in paths]}}})
+            if "runPluginTask" in q:
+                v = req["variables"]
+                seen.append({"task": {"plugin_id": v["plugin_id"], "task_name": v["task_name"],
+                                      "args": v.get("args_map") or {}}})
+                return self.reply(200, {"data": {"runPluginTask": str(len(seen))}})
+            if "version" in q:
+                return self.reply(200, {"data": {"version": {"version": "v0.31.1-fake"}}})
             return self.reply(200, {"data": {"configuration": {"general": {"databasePath": "/x"}}}})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), H)

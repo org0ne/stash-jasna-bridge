@@ -242,6 +242,24 @@ if __name__ == "__main__":
         # binary's path carries no version; answer like Jasna 0.10.
         print("usage: fake jasna [--stream] [--stream-port PORT] [--license-email EMAIL] [--license-key KEY]")
         sys.exit(0)
+    if "--version" in args:
+        print("Jasna: installation verified.\n0.10.0")
+        sys.exit(0)
+    if "--input" in args:
+        # Batch mode (`jasna --input X --output Y`): after --fake-delay
+        # seconds write "restored:" + the input bytes to the output, or exit
+        # with --fake-fail's code, or exit 0 without writing (--fake-no-output).
+        def opt(name, default=None):
+            return args[args.index(name) + 1] if name in args else default
+        time.sleep(float(opt("--fake-delay", 0)))
+        if "--fake-fail" in args:
+            print("fake jasna: failing on request", file=sys.stderr)
+            sys.exit(int(opt("--fake-fail", 3)))
+        if "--fake-no-output" not in args:
+            with open(opt("--input"), "rb") as src, open(opt("--output"), "wb") as dst:
+                dst.write(b"restored:" + src.read())
+        print("fake jasna: done")
+        sys.exit(0)
     epoch_urls = "--epoch-urls" in args
     for i, a in enumerate(args):
         if a == "--stream-port":

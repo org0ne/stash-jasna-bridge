@@ -256,6 +256,26 @@ class ProcessManager:
         proc = self.proc  # no lock, see alive()
         return proc.pid if proc is not None and proc.poll() is None else None
 
+    def version_string(self) -> str:
+        """Jasna's version as a string, from the binary's path ("0.11.3") or
+        else from `jasna --version` (probed once; "" if neither works)."""
+        cached = getattr(self, "_version_string", None)
+        if cached is not None:
+            return cached
+        version = jasna_version_from_path(self.cfg.jasna_binary)
+        text = ".".join(map(str, version)) if version else ""
+        if not text and self.cfg.jasna_binary:
+            cwd = os.path.dirname(os.path.abspath(self.cfg.jasna_binary)) or None
+            try:
+                out = subprocess.run([self.cfg.jasna_binary, "--version"], capture_output=True, text=True,
+                                     timeout=120, stdin=subprocess.DEVNULL, cwd=cwd)
+                m = _VERSION_RE.search((out.stdout or "") + (out.stderr or ""))
+                text = m.group(0) if m else ""
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                text = ""
+        self._version_string = text
+        return text
+
     def matches(self, preset: str) -> bool:
         """True if the running process was started for `preset` with the flags
         that name currently resolves to (a custom preset can be re-sent with

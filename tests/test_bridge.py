@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jasna_bridge import config  # noqa: E402
 from jasna_bridge.cache import SegmentCache  # noqa: E402
 from jasna_bridge.jasna import JasnaClient, ProcessManager  # noqa: E402
+from jasna_bridge.jobs import JobQueue  # noqa: E402
 from jasna_bridge.mpegts import (JASNA_MUX_DELAY_S, looks_partial, partial_size, pcr_values, restamp,  # noqa: E402
                                  segment_span, track_spans, trim_leading_audio)
 from jasna_bridge.playlist import retime  # noqa: E402
@@ -64,11 +65,19 @@ class BridgeHarness:
         self.cache = SegmentCache(self.cfg) if self.cfg.cache_enabled else None
         self.sessions = SessionManager(self.cfg, client, self.procs, self.cache)
         self.sessions.start()
-        self.server = serve(self.cfg, self.sessions, StashClient(self.cfg.stash_url))
+        stash = StashClient(self.cfg.stash_url)
+        self.jobs = None
+        if self.cfg.batch_enabled:
+            self.jobs = JobQueue(self.cfg, self.sessions, stash, lambda p: config.map_path(self.cfg, p))
+            self.jobs.POLL_S = 0.2
+            self.jobs.start()
+        self.server = serve(self.cfg, self.sessions, stash, self.jobs)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def close(self):
         self.server.shutdown(); self.server.server_close()
+        if self.jobs:
+            self.jobs.shutdown()
         self.sessions.shutdown()
         self.stash_srv.shutdown(); self.stash_srv.server_close()
         if self.jasna_srv:
@@ -1262,3 +1271,210 @@ class CustomPresets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Batch(unittest.TestCase):
+    """Offline jobs: the queue runs the fake Jasna in --input/--output mode."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bridge-batch-")
+        self.src_dir = os.path.join(self.tmp, "lib", "CODE-1 Name - Title (2020)")
+        self.out_root = os.path.join(self.tmp, "out")
+        os.makedirs(self.src_dir); os.makedirs(self.out_root)
+        self.src = os.path.join(self.src_dir, "CODE-1.mkv")
+        with open(self.src, "wb") as fh:
+            fh.write(b"mosaic")
+        fake_stash.SCENES["9"] = [self.src, os.path.join(self.src_dir, "CODE-1-pt2.mkv")]
+        self.h = BridgeHarness(managed=True, overrides={
+            "batch": {"enabled": True, "scratch_dir": os.path.join(self.tmp, "scratch"), "grace_s": 0,
+                      "min_free_gb": 0, "output_roots": [self.out_root]},
+            "session": {"heartbeat_idle_s": 5, "stream_linger_s": 0.3, "reaper_interval_s": 0.1},
+        })
+        self.out = os.path.join(self.out_root, "CODE-1 Name - [LTX] Title (2020)", "CODE-1_LTX_jasna.mp4")
+
+    def tearDown(self):
+        self.h.close()
+        fake_stash.SCENES.pop("9", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def submit(self, flags=("--fake-delay", "0.2"), preset="LTX", **over):
+        body = {"scene_id": "9", "file_path": self.src, "output_path": self.out, "preset": preset,
+                "flags": list(flags)}
+        body.update(over)
+        return self.h.call("POST", "/jobs", body)
+
+    def wait_state(self, job_id, states, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            st, body, _ = self.h.call("GET", f"/jobs/{job_id}")
+            self.assertEqual(st, 200, body)
+            if body["job"]["state"] in states:
+                return body["job"]
+            time.sleep(0.1)
+        self.fail(f"job {job_id} did not reach {states}: {body['job']['state']} ({body['job']['error']})")
+
+    def tasks_seen(self):
+        return [s["task"] for s in self.h.stash_seen if "task" in s]
+
+    def test_job_runs_moves_output_and_notifies_stash(self):
+        st, body, _ = self.submit()
+        self.assertEqual(st, 201, body)
+        job = body["job"]
+        self.assertEqual(job["state"], "queued"); self.assertEqual(body["position"], 1)
+        job = self.wait_state(job["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "done", job["error"])
+        with open(self.out, "rb") as fh:
+            self.assertEqual(fh.read(), b"restored:mosaic")
+        self.assertEqual(job["output_bytes"], len(b"restored:mosaic"))
+        self.assertEqual(job["source_bytes"], 6)
+        self.assertGreater(job["duration_s"], 0)
+        self.assertEqual(job["exit_code"], 0)
+        self.assertEqual(job["jasna_version"], "0.10.0")  # probed from the fake's --version
+        self.assertIn("--input", job["command"]); self.assertIn("--no-progress", job["command"])
+        self.assertEqual(job["command"][job["command"].index("--input") + 1], self.src)
+        self.assertFalse(job["ingested"])
+        st, text, hdr = self.h.call("GET", f"/jobs/{job['id']}/log")
+        self.assertEqual(st, 200); self.assertIn(b"fake jasna: done", text)
+        self.assertIn("text/plain", hdr["Content-Type"])
+        events = [t["args"]["event"] for t in self.tasks_seen() if t["args"].get("job_id") == job["id"]]
+        self.assertEqual(events, ["started", "done"])
+        self.assertEqual(self.tasks_seen()[0]["plugin_id"], "jasna-batch")
+        self.assertEqual(self.tasks_seen()[0]["task_name"], "Sync jobs")
+        # scratch is clean afterwards
+        self.assertEqual([f for f in os.listdir(self.h.jobs.scratch_dir) if f.endswith(".mp4")], [])
+        # unacknowledged until the plugin acks; then listed as ingested
+        st, body, _ = self.h.call("GET", "/jobs?state=done&unacknowledged=1")
+        self.assertEqual([j["id"] for j in body["jobs"]], [job["id"]])
+        st, body, _ = self.h.call("POST", f"/jobs/{job['id']}/ack")
+        self.assertEqual(st, 200); self.assertTrue(body["job"]["ingested"])
+        st, body, _ = self.h.call("GET", "/jobs?unacknowledged=1")
+        self.assertEqual(body["count"], 0)
+        st, body, _ = self.h.call("GET", "/health")
+        self.assertEqual(body["batch"]["stats"]["completed"], 1)
+        self.assertIsNone(body["batch"]["running"]); self.assertIsNone(body["batch_job"])
+
+    def test_session_refused_while_job_runs(self):
+        st, body, _ = self.submit(flags=["--fake-delay", "2"])
+        job = self.wait_state(body["job"]["id"], {"running"})
+        st, busy, _ = self.h.call("POST", "/session", {"scene_id": "1"})
+        self.assertEqual(st, 409, busy)
+        self.assertEqual(busy["reason"], "batch"); self.assertEqual(busy["job"]["id"], job["id"])
+        self.assertFalse(busy["takeover_available"])
+        st, health, _ = self.h.call("GET", "/health")
+        self.assertEqual(health["batch"]["running"]["id"], job["id"])
+        self.assertEqual(health["batch_job"]["scene_id"], "9")
+        self.wait_state(job["id"], {"done"})
+        st, body, _ = self.h.call("POST", "/session", {"scene_id": "1"})
+        self.assertEqual(st, 200, body)
+
+    def test_job_waits_for_the_live_session_to_end(self):
+        st, body, _ = self.h.call("POST", "/session", {"scene_id": "1"})
+        self.assertEqual(st, 200, body)
+        token = body["token"]
+        st, body, _ = self.submit()
+        job_id = body["job"]["id"]
+        time.sleep(1.0)
+        st, body, _ = self.h.call("GET", f"/jobs/{job_id}")
+        self.assertEqual(body["job"]["state"], "queued")
+        self.h.call("DELETE", f"/session/{token}")
+        job = self.wait_state(job_id, {"done"})
+        self.assertTrue(os.path.exists(self.out))
+        # the stream process was stopped for the job and is not restarted by it
+        self.assertFalse(self.h.procs.alive())
+
+    def test_duplicate_cancel_queued_and_cancel_running(self):
+        st, a, _ = self.submit(flags=["--fake-delay", "3"])
+        st, dup, _ = self.submit(flags=["--fake-delay", "3"])
+        self.assertEqual(st, 409, dup); self.assertEqual(dup["job"]["id"], a["job"]["id"])
+        st, b, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"))
+        self.assertEqual(st, 201, b)
+        st, body, _ = self.h.call("DELETE", f"/jobs/{b['job']['id']}")
+        self.assertEqual(st, 200); self.assertEqual(body["job"]["state"], "cancelled")
+        self.wait_state(a["job"]["id"], {"running"})
+        st, body, _ = self.h.call("DELETE", f"/jobs/{a['job']['id']}")
+        self.assertEqual(st, 200); self.assertTrue(body["cancelling"])
+        job = self.wait_state(a["job"]["id"], {"cancelled", "failed", "done"}, timeout=20)
+        self.assertEqual(job["state"], "cancelled", job["error"])
+        self.assertFalse(os.path.exists(self.out))
+        st, body, _ = self.h.call("DELETE", f"/jobs/{a['job']['id']}")
+        self.assertEqual(st, 409)
+
+    def test_failures_are_reported(self):
+        st, body, _ = self.submit(flags=["--fake-fail", "3"])
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "failed"); self.assertIn("code 3", job["error"])
+        self.assertEqual(job["exit_code"], 3)
+        st, body, _ = self.submit(flags=["--fake-no-output"], preset="noout", output_path=self.out.replace("LTX", "noout"))
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "failed"); self.assertIn("no output", job["error"])
+        # an output that appeared meanwhile is never overwritten
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        with open(self.out, "wb") as fh:
+            fh.write(b"someone else's")
+        st, body, _ = self.submit(preset="again", output_path=self.out)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "failed"); self.assertIn("already exists", job["error"])
+        with open(self.out, "rb") as fh:
+            self.assertEqual(fh.read(), b"someone else's")
+        events = [t["args"]["event"] for t in self.tasks_seen()]
+        self.assertEqual(events.count("failed"), 3)
+
+    def test_submit_validation(self):
+        st, body, _ = self.submit(flags=["--output", "/x"])
+        self.assertEqual(st, 400); self.assertIn("--output", body["error"])
+        st, body, _ = self.submit(file_path="/nope.mkv")
+        self.assertEqual(st, 404, body)
+        st, body, _ = self.submit(output_path="/elsewhere/x.mp4")
+        self.assertEqual(st, 403, body)
+        st, body, _ = self.submit(output_path=self.out + ".mkv")
+        self.assertEqual(st, 400, body)
+        st, body, _ = self.submit(scene_id="404")
+        self.assertEqual(st, 404, body)
+        st, body, _ = self.submit(flags=[])
+        self.assertEqual(st, 400, body)
+        st, body, _ = self.h.call("GET", "/jobs?state=bogus")
+        self.assertEqual(st, 400)
+        st, body, _ = self.h.call("GET", "/jobs/0123456789ab")
+        self.assertEqual(st, 404)
+
+    def test_disabled_bridge_answers_404(self):
+        plain = BridgeHarness()
+        try:
+            st, body, _ = plain.call("GET", "/jobs")
+            self.assertEqual(st, 404); self.assertIn("batch.enabled", body["error"])
+            st, body, _ = plain.call("GET", "/health")
+            self.assertEqual(body["batch"], {"enabled": False})
+        finally:
+            plain.close()
+
+    def test_check_reports_environment(self):
+        st, body, _ = self.h.call("GET", "/batch/check")
+        self.assertEqual(st, 200, body)
+        labels = {c["label"]: c for c in body["checks"]}
+        self.assertTrue(labels["Jasna binary"]["ok"])
+        self.assertEqual(body["jasna_version"], "0.10.0")
+        self.assertTrue(labels["scratch dir writable"]["ok"])
+        self.assertTrue(labels[f"output root {self.out_root}"]["ok"])
+        self.assertTrue(labels["Stash reachable from the bridge"]["ok"])
+        self.assertIn("model_weights", labels)  # the fake has none; reported, not fatal to the call
+
+    def test_interrupted_job_is_requeued_on_restart(self):
+        st, body, _ = self.submit(flags=["--fake-delay", "5"])
+        job_id = body["job"]["id"]
+        self.wait_state(job_id, {"running"})
+        self.h.jobs.shutdown()   # like a bridge restart mid-job: Jasna killed, record left "running"
+        with open(self.h.jobs.state_file) as fh:
+            self.assertEqual(json.load(fh)["jobs"][0]["state"], "running")
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, None, lambda p: p)
+        reloaded._load()
+        job = reloaded.jobs[job_id]
+        self.assertEqual(job.state, "queued"); self.assertEqual(job.attempts, 1)
+        self.assertIn("re-queued", job.notes[0])
+        # a second interruption exhausts batch.max_attempts (2)
+        job.state, job.attempts = "running", 2
+        reloaded._save()
+        again = JobQueue(self.h.cfg, self.h.sessions, None, lambda p: p)
+        again._load()
+        self.assertEqual(again.jobs[job_id].state, "failed")
+        self.assertIn("giving up", again.jobs[job_id].error)
+        self.h.jobs = None  # already shut down

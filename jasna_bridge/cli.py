@@ -324,6 +324,31 @@ def doctor(args) -> int:
     except OSError as err:
         _check(f"cache dir {cache_dir}", False, str(err))
 
+    if cfg.batch_enabled:
+        scratch = os.path.expanduser(cfg.batch_scratch_dir) or os.path.expanduser("~/.cache/stash-jasna-bridge/batch")
+        try:
+            os.makedirs(scratch, exist_ok=True)
+            st = os.statvfs(scratch)
+            free_gb = st.f_bavail * st.f_frsize / 1e9
+            _check(f"batch scratch {scratch} writable", os.access(scratch, os.W_OK))
+            _check(f"batch scratch free space {free_gb:.0f} GB (need {cfg.batch_min_free_gb:g})",
+                   free_gb >= cfg.batch_min_free_gb)
+        except OSError as err:
+            _check(f"batch scratch {scratch}", False, str(err))
+        for root in cfg.batch_output_roots:
+            mapped = root
+            for sr, jr in cfg.path_map:
+                if root.startswith(sr):
+                    mapped = jr + root[len(sr):]
+                    break
+            _check(f"batch output root {mapped} writable", os.path.isdir(mapped) and os.access(mapped, os.W_OK))
+        weights = os.path.join(os.path.dirname(os.path.abspath(cfg.jasna_binary)), "model_weights")
+        if os.path.isdir(weights):
+            has_ltx = os.path.isdir(os.path.join(weights, "ltx-restore"))
+            print(f"  [{'INFO' if has_ltx else 'WARN'}] LTX model {'present' if has_ltx else 'not downloaded'} in {weights}"
+                  + ("" if has_ltx else " - an LTX batch preset would stop at Jasna's download prompt"))
+        print(f"  [INFO] batch Stash callback: {cfg.batch_notify_plugin} / {cfg.batch_notify_task or '(off)'}")
+
     # Is the bridge itself answering? Ask on the address it listens on.
     host = "127.0.0.1" if cfg.host in ("", "0.0.0.0", "::") else cfg.host
     host = f"[{host}]" if ":" in host else host

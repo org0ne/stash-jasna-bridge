@@ -108,6 +108,11 @@ class SessionManager:
         self.stream_preset: str | None = None
         self.stream_idle_since: float | None = None
         self.process_idle_since: float | None = time.monotonic()
+        # A batch job (jobs.py) holding the GPU: POST /session is refused with
+        # reason "batch" until it finishes. `last_release_at` lets the queue
+        # wait batch.grace_s after the last viewer left before taking over.
+        self.batch_job: dict | None = None
+        self.last_release_at: float | None = None
         self.stats = {"sessions": 0, "opens": 0, "reuses": 0, "idle_releases": 0, "cached_sessions": 0,
                       "seams_restamped": 0, "seeks_forwarded": 0, "seeks_coalesced": 0,
                       "partial_reads": 0, "audio_leads_trimmed": 0}
@@ -161,6 +166,7 @@ class SessionManager:
                     "lingering_seconds": round(now - self.stream_idle_since, 1) if self.stream_idle_since else None,
                     "linger_limit": self.cfg.stream_linger_s,
                 },
+                "batch_job": dict(self.batch_job) if self.batch_job else None,
                 "stats": dict(self.stats),
             }
 
@@ -187,6 +193,9 @@ class SessionManager:
         a preset another viewer's session is running on."""
         with self.lock:
             now = time.monotonic()
+            if self.batch_job:
+                raise Busy({"reason": "batch", "scene_id": self.batch_job.get("scene_id"),
+                            "job": dict(self.batch_job), "idle_seconds": 0, "takeover_available": False})
             if self.preparing:
                 raise Busy({"reason": "preparing", "scene_id": self.preparing["scene_id"],
                             "owner_since": round(now - self.preparing["since"], 1), "idle_seconds": 0,
@@ -410,6 +419,43 @@ class SessionManager:
             s = self.get(token)
             self._release(s, "ended by client")
 
+    # ----- batch jobs -----
+    def batch_acquire(self, job: dict, grace_s: float) -> bool:
+        """Take the GPU for a batch job: only when no session is active or
+        being prepared and the last one ended at least `grace_s` ago. Closes
+        a lingering stream and stops the managed process so the VRAM is
+        free, then marks the bridge busy for viewers. Network I/O (the stop)
+        happens outside the lock."""
+        with self.lock:
+            if self.current is not None or self.preparing is not None or self.batch_job is not None:
+                return False
+            now = time.monotonic()
+            if self.last_release_at is not None and now - self.last_release_at < grace_s:
+                return False
+            self.batch_job = dict(job)
+            had_stream = self.stream_path is not None
+        if had_stream:
+            with self.lock:
+                if self.stream_path is not None:
+                    self._close_stream("batch job starting")
+        if self.procs.managed and self.procs.alive():
+            log.info("stopping the stream Jasna for batch job %s", job.get("id"))
+            self.procs.stop()
+        with self.lock:
+            self.process_idle_since = None
+            self._jasna_last_seg = None
+        log.info("GPU taken by batch job %s (scene %s, preset %s)", job.get("id"), job.get("scene_id"),
+                 job.get("preset"))
+        return True
+
+    def batch_release(self) -> None:
+        with self.lock:
+            if self.batch_job is None:
+                return
+            log.info("GPU released by batch job %s", self.batch_job.get("id"))
+            self.batch_job = None
+            self.process_idle_since = time.monotonic()
+
     # ----- internals (call with lock held) -----
     def _register_custom(self, preset) -> None:
         custom = self.cfg.custom
@@ -427,6 +473,7 @@ class SessionManager:
                  time.monotonic() - s.created)
         if self.current is s:
             self.current = None
+        self.last_release_at = time.monotonic()
         if self.stream_path is not None:
             self.stream_idle_since = time.monotonic()
 

@@ -52,7 +52,12 @@ def main(argv=None) -> int:
     sessions = SessionManager(cfg, jasna, procs, cache)
     stash = StashClient(cfg.stash_url, cfg.stash_api_key)
     sessions.start()
-    server = serve(cfg, sessions, stash)
+    jobs = None
+    if cfg.batch_enabled:
+        from .jobs import JobQueue
+        jobs = JobQueue(cfg, sessions, stash, lambda p: config.map_path(cfg, p))
+        jobs.start()
+    server = serve(cfg, sessions, stash, jobs)
 
     done = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -60,6 +65,8 @@ def main(argv=None) -> int:
     done.wait()
     logging.getLogger("bridge").info("shutting down")
     server.shutdown()
+    if jobs is not None:
+        jobs.shutdown()
     sessions.shutdown()
     return 0
 

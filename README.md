@@ -76,6 +76,12 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | GET | `/hls/{token}/seg_NNNNN.ts` | segment proxied from Jasna (blocks while it renders) |
 | GET | `/presets` | preset names, default, currently running, warm, `custom_allowed` |
 | GET | `/health` | Jasna reachable/streaming/managed/pid/warm + session snapshot |
+| POST | `/jobs` | `{scene_id, file_path, output_path, preset, flags}` → **201** `{job, position}`; **409** when the same file+preset is already queued or running; **403** outside `batch.output_roots`. Batch jobs, see below |
+| GET | `/jobs[?state=queued,running&unacknowledged=1]` | job list |
+| GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
+| POST | `/jobs/{id}/ack` | the plugin has ingested the result |
+| GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
+| GET | `/batch`, `/batch/check` | queue snapshot / environment checks for the plugin's *Check settings* task |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
 through Stash GraphQL (`findScene { files { path } }`) and applies the
@@ -219,6 +225,35 @@ optional `[[paths.map]]` rewrites.
   new flags. Custom presets are never listed by `/presets` (the plugin
   keeps that list) and do not survive a bridge restart. Off by default:
   anyone who can create a session then chooses Jasna's launch flags.
+- **Batch jobs (opt-in, managed mode).** With `batch.enabled = true` the
+  bridge also runs offline restorations for the Stash
+  [jasna-batch](https://github.com/org0ne/stash-plugins/tree/main/plugins/jasna-batch)
+  plugin: `POST /jobs` names a scene, one of its files, the preset's flags
+  (validated like a custom preset) and where the finished `.mp4` must land.
+  Jobs run one at a time in submission order. A job waits until no live
+  session is active or being prepared and `batch.grace_s` has passed since
+  the last one ended, then closes any lingering stream, stops the stream
+  Jasna (VRAM) and runs `jasna --input <file> --output <scratch>/<id>.mp4
+  --working-directory <scratch>/work-<id> --no-progress common_flags
+  batch.common_flags flags`. While it runs, `POST /session` answers 409
+  `{"reason": "batch", "job": {...}}` (the plugin shows `JASNA: BATCH`) and
+  `/health` reports the job under `batch.running` / `batch_job`. On exit 0
+  the output is moved to its final path (copy + rename across volumes, so
+  the final name never holds a half-written file); a non-zero exit, an
+  empty output, a timeout (`batch.job_timeout_h`) or a file that appeared
+  at the destination meanwhile fails the job with the reason in its record
+  and Jasna's output in `GET /jobs/{id}/log`. Every state change runs the
+  plugin's *Sync jobs* task in Stash (`batch.notify_plugin` /
+  `notify_task`), which moves the scene's status tag and ingests finished
+  jobs; a job stays listed as unacknowledged until the plugin `ack`s it.
+  The queue is persisted to `<scratch>/jobs.json`: a bridge restart keeps
+  it, and a job that was running is re-queued (partial output discarded)
+  up to `batch.max_attempts` times. Free space on scratch and on the output
+  volume is checked before each run (`batch.min_free_gb`, and twice the
+  source size). Jasna's interactive prompts are never answered: a preset
+  naming a model that is not downloaded fails at Jasna's download prompt,
+  which `GET /batch/check` (and the plugin's *Check settings*) warns about
+  for LTX.
 - **Auth.** `none`, `token` (Authorization: Bearer / X-Bridge-Token on
   `/session`, `/presets`), or `stash_cookie` (the browser's Stash cookie is
   forwarded to Stash GraphQL and cached for `cache_s`). Token-in-path

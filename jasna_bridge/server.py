@@ -13,8 +13,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import VERSION
-from .config import validate_custom_preset
+from .config import map_path, validate_custom_preset
 from .jasna import JasnaError
+from .jobs import ACTIVE as JOB_ACTIVE, STATES as JOB_STATES, JobError
 from .mpegts import JASNA_MUX_DELAY_S, looks_partial, restamp, track_spans, trim_leading_audio
 from .playlist import retime
 from .sessions import Busy, NoSession
@@ -23,6 +24,7 @@ from .stash import CookieValidator, StashClient, StashError
 log = logging.getLogger("bridge.http")
 
 TOKEN_RE = r"(?P<token>[A-Za-z0-9_-]{16,64})"
+JOB_RE = r"(?P<job_id>[0-9a-f]{12})"
 ROUTES = [
     ("GET", re.compile(r"^/health$"), "health", False),
     ("GET", re.compile(r"^/presets$"), "presets", True),
@@ -33,25 +35,32 @@ ROUTES = [
     ("DELETE", re.compile(rf"^/session/{TOKEN_RE}$"), "end", False),
     ("GET", re.compile(rf"^/hls/{TOKEN_RE}/stream\.m3u8$"), "playlist", False),
     ("GET", re.compile(rf"^/hls/{TOKEN_RE}/(?P<seg>seg_[0-9]{{5}}\.ts)$"), "segment", False),
+    # Batch jobs (jobs.py), used by the Stash jasna-batch plugin.
+    ("GET", re.compile(r"^/batch$"), "batch", True),
+    ("GET", re.compile(r"^/batch/check$"), "batch_check", True),
+    ("GET", re.compile(r"^/jobs$"), "jobs_list", True),
+    ("POST", re.compile(r"^/jobs$"), "jobs_post", True),
+    ("GET", re.compile(rf"^/jobs/{JOB_RE}$"), "job_get", True),
+    ("DELETE", re.compile(rf"^/jobs/{JOB_RE}$"), "job_delete", True),
+    ("POST", re.compile(rf"^/jobs/{JOB_RE}/ack$"), "job_ack", True),
+    ("GET", re.compile(rf"^/jobs/{JOB_RE}/log$"), "job_log", True),
 ]
 
 
 class Bridge:
     """Shared state handed to every request handler."""
 
-    def __init__(self, cfg, sessions, stash: StashClient):
+    def __init__(self, cfg, sessions, stash: StashClient, jobs=None):
         self.cfg = cfg
         self.sessions = sessions
         self.cache = getattr(sessions, "cache", None)
         self.stash = stash
+        self.jobs = jobs  # JobQueue, or None when batch.enabled = false
         self.cookies = CookieValidator(stash, cfg.auth_cache_s) if cfg.auth_mode == "stash_cookie" else None
         self.started = time.time()
 
     def map_path(self, path: str) -> str:
-        for stash_root, jasna_root in self.cfg.path_map:
-            if path.startswith(stash_root):
-                return jasna_root + path[len(stash_root):]
-        return path
+        return map_path(self.cfg, path)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -165,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
                 return getattr(self, "h_" + name)(**match.groupdict())
             except NoSession:
                 return self.error(HTTPStatus.GONE, "no such session")
+            except JobError as err:
+                return self.error(err.status, str(err), **err.extra)
             except (ValueError, json.JSONDecodeError) as err:
                 return self.error(HTTPStatus.BAD_REQUEST, f"bad request: {err}")
             except (BrokenPipeError, ConnectionResetError):
@@ -194,8 +205,71 @@ class Handler(BaseHTTPRequestHandler):
                 "warm": b.sessions.is_warm(),
             },
             "cache": b.cache.snapshot() if b.cache else {"enabled": False},
+            "batch": b.jobs.snapshot() if b.jobs else {"enabled": False},
             **b.sessions.snapshot(),
         })
+
+    # ----- batch jobs -----
+    def jobs_or_404(self):
+        jobs = self.bridge.jobs
+        if jobs is None:
+            raise JobError("batch jobs are disabled on this bridge (batch.enabled = false)", HTTPStatus.NOT_FOUND)
+        return jobs
+
+    def h_batch(self):
+        jobs = self.jobs_or_404()
+        self.send_json(HTTPStatus.OK, {**jobs.snapshot(), "jasna_version": self.bridge.sessions.procs.version_string(),
+                                       "output_roots": self.bridge.cfg.batch_output_roots,
+                                       "grace_s": self.bridge.cfg.batch_grace_s,
+                                       "min_free_gb": self.bridge.cfg.batch_min_free_gb})
+
+    def h_batch_check(self):
+        self.send_json(HTTPStatus.OK, self.jobs_or_404().check())
+
+    def h_jobs_list(self):
+        jobs = self.jobs_or_404()
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        states = None
+        if query.get("state"):
+            states = {s for s in query["state"][0].split(",") if s}
+            bad = states - set(JOB_STATES)
+            if bad:
+                raise ValueError(f"unknown state(s) {sorted(bad)}; choose from {', '.join(JOB_STATES)}")
+        unacked = query.get("unacknowledged", ["0"])[0] in ("1", "true", "yes")
+        found = jobs.list(states, unacked_only=unacked)
+        self.send_json(HTTPStatus.OK, {"jobs": [j.public() for j in found], "count": len(found)})
+
+    def h_jobs_post(self):
+        jobs = self.jobs_or_404()
+        body = self.read_json()
+        scene_id = str(body.get("scene_id") or "").strip()
+        if not scene_id.isdigit():
+            raise ValueError("scene_id must be a numeric Stash scene id")
+        preset = body.get("preset")
+        flags = body.get("flags")
+        if not isinstance(preset, str) or not isinstance(flags, list):
+            raise ValueError("preset (string) and flags (list) are required")
+        job = jobs.submit(scene_id, str(body.get("file_path") or ""), str(body.get("output_path") or ""),
+                          preset, flags, self.client_ip())
+        self.send_json(HTTPStatus.CREATED, {"job": job.public(), "position": len(jobs.queued())})
+
+    def h_job_get(self, job_id: str):
+        job = self.jobs_or_404().get(job_id)
+        if job is None:
+            raise JobError("no such job", HTTPStatus.NOT_FOUND)
+        self.send_json(HTTPStatus.OK, {"job": job.public()})
+
+    def h_job_delete(self, job_id: str):
+        job = self.jobs_or_404().cancel(job_id)
+        self.send_json(HTTPStatus.OK, {"job": job.public(), "cancelling": job.state in JOB_ACTIVE})
+
+    def h_job_ack(self, job_id: str):
+        job = self.jobs_or_404().ack(job_id)
+        self.send_json(HTTPStatus.OK, {"job": job.public()})
+
+    def h_job_log(self, job_id: str):
+        text = self.jobs_or_404().log_tail(job_id)
+        self.send(HTTPStatus.OK, text.encode(), "text/plain; charset=utf-8")
 
     def h_presets(self):
         cfg = self.bridge.cfg
@@ -461,8 +535,8 @@ class BridgeServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def serve(cfg, sessions, stash: StashClient) -> ThreadingHTTPServer:
-    bridge = Bridge(cfg, sessions, stash)
+def serve(cfg, sessions, stash: StashClient, jobs=None) -> ThreadingHTTPServer:
+    bridge = Bridge(cfg, sessions, stash, jobs)
     handler = type("BridgeHandler", (Handler,), {"bridge": bridge})
     server = BridgeServer((cfg.host, cfg.port), handler)
     server.bridge = bridge

@@ -38,6 +38,72 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def video_packets(path, ffprobe) -> int:
+    out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
+                          "stream=nb_read_packets", "-of", "csv=p=0", path], capture_output=True, text=True)
+    return int((out.stdout or "0").strip().splitlines()[0] or 0)
+
+
+def _mp4_boxes(data: bytes, start: int, end: int):
+    """(type, header_size, box_start, box_end) for each box in data[start:end]."""
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        header = 8
+        if size == 1:
+            size = int.from_bytes(data[pos + 8:pos + 16], "big"); header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header:
+            break
+        yield kind, header, pos, pos + size
+        pos += size
+
+
+def patch_video_elst(path: str, offset_fraction: float) -> bool:
+    """Break the video track's edit list like Jasna 0.11.3 does: set the
+    first entry's media_time to offset_fraction of a second, which must be
+    below the first keyframe's PTS (the B-frame delay) so ffprobe warns
+    "Missing key frame while searching for timestamp". False if the file
+    has no video elst to patch."""
+    data = bytearray(open(path, "rb").read())
+    for kind, h, a, b in _mp4_boxes(data, 0, len(data)):
+        if kind != b"moov":
+            continue
+        for kind, h2, c, d in _mp4_boxes(data, a + h, b):
+            if kind != b"trak":
+                continue
+            timescale, is_video, elst = None, False, None
+            for kind, h3, e, f in _mp4_boxes(data, c + h2, d):
+                if kind == b"mdia":
+                    for kind, h4, g, i in _mp4_boxes(data, e + h3, f):
+                        if kind == b"mdhd":
+                            v = data[g + h4]
+                            timescale = int.from_bytes(data[g + h4 + (20 if v == 1 else 12):][:4], "big")
+                        if kind == b"hdlr":
+                            is_video = data[g + h4 + 8:g + h4 + 12] == b"vide"
+                if kind == b"edts":
+                    for kind, h4, g, i in _mp4_boxes(data, e + h3, f):
+                        if kind == b"elst":
+                            elst = (g, h4)
+            if is_video and elst and timescale:
+                g, h4 = elst
+                version = data[g + h4]
+                count = int.from_bytes(data[g + h4 + 4:g + h4 + 8], "big")
+                if not count:
+                    return False
+                entry = g + h4 + 8
+                media_time = int(timescale * offset_fraction)
+                if version == 1:
+                    data[entry + 8:entry + 16] = media_time.to_bytes(8, "big", signed=True)
+                else:
+                    data[entry + 4:entry + 8] = media_time.to_bytes(4, "big", signed=True)
+                open(path, "wb").write(data)
+                return True
+    return False
+
+
 class BridgeHarness:
     def __init__(self, overrides: dict | None = None, require_cookie: str | None = None, managed=False):
         self.stash_srv, self.stash_seen = fake_stash.start(require_cookie)
@@ -1516,7 +1582,7 @@ class Batch(unittest.TestCase):
             job = reloaded.jobs[job_id]
             self.assertEqual(job.state, "done", job.error)
             self.assertTrue(os.path.exists(self.out))
-            self.assertIn("exit code unknown", job.notes[-1])
+            self.assertTrue(any("exit code unknown" in n for n in job.notes), job.notes)
             self.assertEqual(job.progress["percent"], 100)
             self.assertIsNone(self.h.sessions.batch_job)
         finally:
@@ -1588,11 +1654,57 @@ class Batch(unittest.TestCase):
         self.assertEqual(job["output_bytes"], os.path.getsize(self.out))
         st, text, _ = self.h.call("GET", f"/jobs/{job['id']}/log")
         self.assertIn(b"===== audio -> aac", text)
-        # already AAC: nothing to do, no result recorded
-        self.assertIsNone(audio.ensure_codec(self.out, "aac", ffmpeg, ffprobe))
+        # already AAC with a clean edit list: nothing to do, file untouched
+        before = open(self.out, "rb").read()
+        self.assertIsNone(audio.fix_output(self.out, "aac", ffmpeg, ffprobe))
+        self.assertEqual(open(self.out, "rb").read(), before)
         # an unsupported codec is refused at submit
         st, body, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"), audio="opus")
         self.assertEqual(st, 400, body)
+
+    def test_broken_edit_list_is_rewritten(self):
+        from jasna_bridge import audio
+        ffmpeg, ffprobe = audio.find_tools()
+        if not (ffmpeg and ffprobe):
+            self.skipTest("ffmpeg not installed")
+        # libx264 with B-frames: the first frame's PTS is the decode delay and ffmpeg
+        # writes a video edit list whose media_time points at it
+        made = subprocess.run([ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10",
+                               "-f", "lavfi", "-i", "sine=frequency=440", "-t", "1", "-c:v", "libx264", "-preset", "veryfast",
+                               "-bf", "2", "-c:a", "aac", "-shortest", "-f", "mp4", self.src], capture_output=True, text=True)
+        # (-f mp4: the fixture path ends in .mkv, and only an MP4 has an elst box)
+        if made.returncode != 0:
+            self.skipTest(f"ffmpeg cannot make the fixture: {made.stderr.strip()[-200:]}")
+        self.assertFalse(audio.broken_edit_list(self.src, ffprobe))           # a normal file is clean
+        frames = video_packets(self.src, ffprobe)
+        self.assertGreaterEqual(frames, 10)
+        if not patch_video_elst(self.src, offset_fraction=0.1):
+            self.skipTest("fixture has no video edit list to patch")
+        self.assertTrue(audio.broken_edit_list(self.src, ffprobe))            # media_time now points off the keyframe
+        # the job asks for AAC (already AAC): only the edit list is rewritten, audio untouched
+        st, body, _ = self.submit(flags=["--fake-delay", "0.2", "--fake-passthrough"], audio="aac")
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "done", job["error"])
+        self.assertFalse(audio.broken_edit_list(self.out, ffprobe))
+        self.assertEqual(video_packets(self.out, ffprobe), frames)
+        self.assertEqual([a["codec"] for a in audio.probe_audio(self.out, ffprobe)], ["aac"])
+        self.assertEqual(job["audio_result"]["edit_list"], True)
+        self.assertNotIn("from", job["audio_result"])
+        self.assertTrue(any(n.startswith("edit list rewritten") for n in job["notes"]), job["notes"])
+        self.assertFalse(any(n.startswith("audio ") for n in job["notes"]), job["notes"])
+        st, text, _ = self.h.call("GET", f"/jobs/{job['id']}/log")
+        self.assertIn(b"===== edit list:", text)
+        # a job that asked for no audio codec still gets the edit list fixed
+        shutil.copyfile(self.out, self.src); patch_video_elst(self.src, offset_fraction=0.1)
+        self.assertTrue(audio.broken_edit_list(self.src, ffprobe))
+        out2 = self.out.replace("LTX", "other")
+        st, body, _ = self.submit(flags=["--fake-delay", "0.2", "--fake-passthrough"], preset="other", output_path=out2, audio="")
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "done", job["error"])
+        self.assertFalse(audio.broken_edit_list(out2, ffprobe))
+        self.assertEqual(job["audio_result"], {"edit_list": True, "seconds": job["audio_result"]["seconds"]})
 
     def test_disabled_bridge_answers_404(self):
         plain = BridgeHarness()

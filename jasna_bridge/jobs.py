@@ -483,9 +483,8 @@ class JobQueue:
             self._discard(out_tmp)
             return self._finish(job, "failed", "Jasna exited but wrote no output file")
         job.output_bytes = os.path.getsize(out_tmp)
-        if job.audio:
-            self._fix_audio(job, out_tmp)
-            job.output_bytes = os.path.getsize(out_tmp)
+        self._fix_output(job, out_tmp)
+        job.output_bytes = os.path.getsize(out_tmp)
         if os.path.exists(job.output):
             # The plugin checks this before submitting; a file appearing
             # meanwhile is not ours to replace. Keep the result where a human
@@ -503,25 +502,37 @@ class JobQueue:
             return self._finish(job, "failed", f"output copy to {job.output} came up short; result left at {out_tmp}")
         self._finish(job, "done", "")
 
-    def _fix_audio(self, job: Job, out_tmp: str) -> None:
-        """Re-encode the finished file's audio to job.audio when it is
-        something else (Jasna copies the source stream). A failure keeps
-        Jasna's file and is noted on the job rather than failing it."""
+    def _fix_output(self, job: Job, out_tmp: str) -> None:
+        """One stream-copy remux of the finished file when its audio is not
+        job.audio (Jasna copies the source stream) or its edit list is
+        broken (audio.py). A failure keeps Jasna's file and is noted on the
+        job rather than failing it."""
         ffmpeg, ffprobe = audio_fix.find_tools(self.cfg.batch_ffmpeg)
+        if not (ffmpeg and ffprobe):
+            if job.audio:
+                with self.lock:
+                    job.notes.append(f"audio left as Jasna wrote it: ffmpeg/ffprobe not found, cannot convert to {job.audio}")
+                log.warning("job %s: ffmpeg/ffprobe not found; audio not converted to %s", job.id, job.audio)
+            return
         try:
-            result = audio_fix.ensure_codec(out_tmp, job.audio, ffmpeg, ffprobe, job.log_file)
+            result = audio_fix.fix_output(out_tmp, job.audio, ffmpeg, ffprobe, job.log_file)
         except audio_fix.AudioError as err:
-            log.warning("job %s: audio not converted to %s: %s", job.id, job.audio, err)
+            log.warning("job %s: output left as Jasna wrote it: %s", job.id, err)
             with self.lock:
-                job.notes.append(f"audio left as Jasna wrote it; conversion to {job.audio} failed: {err}"[:300])
+                job.notes.append(f"output left as Jasna wrote it (audio/edit list fix-up failed): {err}"[:300])
+            return
+        if not result:
             return
         with self.lock:
             job.audio_result = result
-            if result:
+            if result.get("from"):
                 job.notes.append(f"audio {result['from']} -> {result['to']} {result['bitrate']} "
                                  f"({result['channels']}ch, ffmpeg {result['seconds']}s)")
-        if result:
-            log.info("job %s: audio %s -> %s in %.0fs", job.id, result["from"], result["to"], result["seconds"])
+            if result.get("edit_list"):
+                job.notes.append(f"edit list rewritten (stream-copy remux, {result['seconds']}s)")
+        log.info("job %s: output fixed in %.0fs: %s%s", job.id, result["seconds"],
+                 f"audio {result['from']} -> {result['to']}" if result.get("from") else "",
+                 (", " if result.get("from") else "") + "edit list rewritten" if result.get("edit_list") else "")
 
     def _adopt_running(self, job: Job, pid: int) -> None:
         """Watch a Jasna left running by the previous bridge until it exits,

@@ -2,4 +2,4 @@
 in front of an unmodified `jasna --stream` process, for the Stash
 jasna-switch plugin. Stdlib only."""
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"

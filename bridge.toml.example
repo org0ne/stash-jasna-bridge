@@ -91,6 +91,8 @@ notify_plugin = "jasna-batch"  # Stash plugin + task run on every job state chan
 notify_task = "Sync jobs"      #   status tag follows the job ("" turns the callback off)
 progress = true             # let Jasna print its progress bar into the job log; /jobs reports percent and ETA
 keep_running_on_restart = true  # a bridge restart leaves the running Jasna alone and adopts it afterwards
-ffmpeg = ""                 # for the audio fix-up: a job submitted with audio = "aac" gets any non-AAC audio
-                            #   re-encoded (video copied) before the move; blank: ffmpeg/ffprobe on PATH
+ffmpeg = ""                 # for the output fix-up before the move: a job submitted with audio = "aac" gets
+                            #   any non-AAC audio re-encoded (video copied), and every output with a broken
+                            #   edit list (Jasna 0.11.3, constant lip-sync offset) is stream-copy remuxed;
+                            #   blank: ffmpeg/ffprobe on PATH
                             #   (the unit must have KillMode=process, as deploy/stash-jasna-bridge.service does)

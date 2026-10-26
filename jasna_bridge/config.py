@@ -111,6 +111,7 @@ class Config:
     batch_progress: bool = True      # let Jasna print its progress bar into the job log and report percent/ETA
     batch_keep_running_on_restart: bool = True  # a bridge stop leaves the running Jasna alone; the next bridge
                                      # start adopts it (needs KillMode=process in the unit)
+    batch_ffmpeg: str = ""           # ffmpeg for the audio fix-up of finished outputs (audio.py); blank: on PATH
 
     # [gpu]: whole-GPU load sampled with nvidia-smi for the queue page's
     # sparkline (gpu.py). Off automatically where nvidia-smi is missing.
@@ -270,6 +271,7 @@ def from_dict(data: dict) -> Config:
     cfg.batch_max_attempts = _get(batch, "max_attempts", cfg.batch_max_attempts)
     cfg.batch_progress = _get(batch, "progress", cfg.batch_progress)
     cfg.batch_keep_running_on_restart = _get(batch, "keep_running_on_restart", cfg.batch_keep_running_on_restart)
+    cfg.batch_ffmpeg = _get(batch, "ffmpeg", cfg.batch_ffmpeg)
     gpu = data.get("gpu", {})
     cfg.gpu_sample = _get(gpu, "sample", cfg.gpu_sample)
     cfg.gpu_sample_seconds = _get(gpu, "sample_seconds", cfg.gpu_sample_seconds)

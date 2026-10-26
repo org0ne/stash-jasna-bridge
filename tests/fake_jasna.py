@@ -274,7 +274,8 @@ if __name__ == "__main__":
             sys.exit(int(opt("--fake-fail", 3)))
         if "--fake-no-output" not in args:
             with open(opt("--input"), "rb") as src, open(opt("--output"), "wb") as dst:
-                dst.write(b"restored:" + src.read())
+                # --fake-passthrough: the input bytes verbatim (a real media file stays one)
+                dst.write((b"" if "--fake-passthrough" in args else b"restored:") + src.read())
         print("fake jasna: done")
         sys.exit(0)
     epoch_urls = "--epoch-urls" in args

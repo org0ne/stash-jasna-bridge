@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass, field
 
 from .config import validate_custom_preset
 from .stash import StashError
+from . import audio as audio_fix
 
 log = logging.getLogger("bridge.jobs")
 
@@ -72,6 +73,8 @@ class Job:
     attempts: int = 0
     ingested: bool = False   # the plugin acknowledged it (copied sidecars, scanned, ...)
     result_scene_id: str | None = None   # the Stash scene made from the output, as the plugin reported it on ack
+    audio: str = ""          # "aac": re-encode non-AAC audio of the finished file before the move (audio.py)
+    audio_result: dict | None = None     # {"from", "to", "channels", "bitrate", "seconds"} when that happened
     notes: list[str] = field(default_factory=list)
     pid: int | None = None   # Jasna's pid while running (so a restarted bridge can adopt it)
     # Parsed from Jasna's progress bar in the log: {"percent", "eta_s", "rate", "detail", "updated"}
@@ -221,9 +224,12 @@ class JobQueue:
 
     # ----- commands -----
     def submit(self, scene_id: str, stash_source: str, stash_output: str, preset: str,
-               flags: list[str], client: str) -> Job:
+               flags: list[str], client: str, audio: str = "") -> Job:
         if not stash_source or not stash_output:
             raise JobError("file_path and output_path are required")
+        audio = (audio or "").strip().lower()
+        if audio and audio not in audio_fix.ALLOWED_CODECS:
+            raise JobError(f"audio must be empty or one of {sorted(audio_fix.ALLOWED_CODECS)}")
         if not os.path.isabs(stash_output) or not stash_output.lower().endswith(OUTPUT_EXT):
             raise JobError(f"output_path must be an absolute path ending in {OUTPUT_EXT}")
         roots = self.cfg.batch_output_roots
@@ -249,7 +255,7 @@ class JobQueue:
                     raise JobError("an identical job is already queued or running", 409, job=j.public())
             job = Job(id=secrets.token_hex(6), scene_id=str(scene_id), stash_source=stash_source, source=source,
                       stash_output=stash_output, output=output, preset=preset, flags=list(flags), client=client,
-                      source_bytes=os.path.getsize(source))
+                      source_bytes=os.path.getsize(source), audio=audio)
             self.jobs[job.id] = job
             self.stats["submitted"] += 1
         self._save()
@@ -336,6 +342,9 @@ class JobQueue:
             mapped = self.map_path(root)
             add(f"output root {root}", os.path.isdir(mapped) and os.access(mapped, os.W_OK),
                 "writable" if os.path.isdir(mapped) and os.access(mapped, os.W_OK) else f"{mapped} not a writable directory")
+        ffmpeg, ffprobe = audio_fix.find_tools(cfg.batch_ffmpeg)
+        add("ffmpeg + ffprobe (audio fix-up)", bool(ffmpeg and ffprobe),
+            f"{ffmpeg}, {ffprobe}" if ffmpeg and ffprobe else "not found; jobs asking for AAC audio keep Jasna's audio")
         gpu = shutil.which("nvidia-smi")
         if gpu:
             try:
@@ -474,6 +483,9 @@ class JobQueue:
             self._discard(out_tmp)
             return self._finish(job, "failed", "Jasna exited but wrote no output file")
         job.output_bytes = os.path.getsize(out_tmp)
+        if job.audio:
+            self._fix_audio(job, out_tmp)
+            job.output_bytes = os.path.getsize(out_tmp)
         if os.path.exists(job.output):
             # The plugin checks this before submitting; a file appearing
             # meanwhile is not ours to replace. Keep the result where a human
@@ -490,6 +502,26 @@ class JobQueue:
         if not moved:
             return self._finish(job, "failed", f"output copy to {job.output} came up short; result left at {out_tmp}")
         self._finish(job, "done", "")
+
+    def _fix_audio(self, job: Job, out_tmp: str) -> None:
+        """Re-encode the finished file's audio to job.audio when it is
+        something else (Jasna copies the source stream). A failure keeps
+        Jasna's file and is noted on the job rather than failing it."""
+        ffmpeg, ffprobe = audio_fix.find_tools(self.cfg.batch_ffmpeg)
+        try:
+            result = audio_fix.ensure_codec(out_tmp, job.audio, ffmpeg, ffprobe, job.log_file)
+        except audio_fix.AudioError as err:
+            log.warning("job %s: audio not converted to %s: %s", job.id, job.audio, err)
+            with self.lock:
+                job.notes.append(f"audio left as Jasna wrote it; conversion to {job.audio} failed: {err}"[:300])
+            return
+        with self.lock:
+            job.audio_result = result
+            if result:
+                job.notes.append(f"audio {result['from']} -> {result['to']} {result['bitrate']} "
+                                 f"({result['channels']}ch, ffmpeg {result['seconds']}s)")
+        if result:
+            log.info("job %s: audio %s -> %s in %.0fs", job.id, result["from"], result["to"], result["seconds"])
 
     def _adopt_running(self, job: Job, pid: int) -> None:
         """Watch a Jasna left running by the previous bridge until it exits,

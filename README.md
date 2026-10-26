@@ -255,6 +255,15 @@ optional `[[paths.map]]` rewrites.
   naming a model that is not downloaded fails at Jasna's download prompt,
   which `GET /batch/check` (and the plugin's *Check settings*) warns about
   for LTX.
+- **Audio fix-up.** Jasna copies the source's audio stream, so an MP3 or
+  AC3 source becomes an MP4 with MP3 or AC3 audio, which browsers will
+  not play. A job submitted with `audio: "aac"` (the plugin's *Audio
+  codec* setting, default) has its finished file probed on scratch and,
+  when any audio stream is not AAC, re-encoded with ffmpeg (`-c:v copy
+  -c:a aac`, 96 kbit/s per channel, `+faststart`) before the move; the job
+  records `audio_result` and a note. Already-AAC files are left alone. A
+  failed conversion keeps Jasna's file and notes why. `batch.ffmpeg`
+  names the binary when it is not on PATH; `GET /batch/check` reports it.
 - **Progress and restarts.** Jobs run with Jasna's progress bar on
   (`batch.progress`); the bridge reads its last update from the job log
   every 3s and reports `progress: {percent, eta_s, rate, pass, passes,

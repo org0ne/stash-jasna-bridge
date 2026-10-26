@@ -265,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(preset, str) or not isinstance(flags, list):
             raise ValueError("preset (string) and flags (list) are required")
         job = jobs.submit(scene_id, str(body.get("file_path") or ""), str(body.get("output_path") or ""),
-                          preset, flags, self.client_ip())
+                          preset, flags, self.client_ip(), audio=str(body.get("audio") or ""))
         self.send_json(HTTPStatus.CREATED, {"job": job.public(), "position": len(jobs.queued())})
 
     def h_job_get(self, job_id: str):

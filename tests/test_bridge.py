@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -1565,6 +1566,33 @@ class Batch(unittest.TestCase):
             self.assertIsNone(body["gpu"])                    # no graphic rather than a dead gauge
         finally:
             off.close()
+
+    def test_non_aac_audio_is_converted_after_jasna(self):
+        from jasna_bridge import audio
+        ffmpeg, ffprobe = audio.find_tools()
+        if not (ffmpeg and ffprobe):
+            self.skipTest("ffmpeg not installed")
+        # a one-second MP4 with AC3 audio stands in for a Jasna output made from an AC3 source
+        made = subprocess.run([ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10",
+                               "-f", "lavfi", "-i", "sine=frequency=440", "-t", "1", "-c:v", "mpeg4", "-c:a", "ac3",
+                               "-shortest", self.src], capture_output=True, text=True)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual([a["codec"] for a in audio.probe_audio(self.src, ffprobe)], ["ac3"])
+        st, body, _ = self.submit(flags=["--fake-delay", "0.2", "--fake-passthrough"], audio="aac")
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "done", job["error"])
+        self.assertEqual([a["codec"] for a in audio.probe_audio(self.out, ffprobe)], ["aac"])
+        self.assertEqual((job["audio_result"]["from"], job["audio_result"]["to"]), ("ac3", "aac"))
+        self.assertTrue(any(n.startswith("audio ac3 -> aac") for n in job["notes"]), job["notes"])
+        self.assertEqual(job["output_bytes"], os.path.getsize(self.out))
+        st, text, _ = self.h.call("GET", f"/jobs/{job['id']}/log")
+        self.assertIn(b"===== audio -> aac", text)
+        # already AAC: nothing to do, no result recorded
+        self.assertIsNone(audio.ensure_codec(self.out, "aac", ffmpeg, ffprobe))
+        # an unsupported codec is refused at submit
+        st, body, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"), audio="opus")
+        self.assertEqual(st, 400, body)
 
     def test_disabled_bridge_answers_404(self):
         plain = BridgeHarness()

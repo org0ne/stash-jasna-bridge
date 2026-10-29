@@ -81,8 +81,10 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
 | POST | `/jobs/{id}/ack` | the plugin has ingested the result; optional body `{"scene_id"}` = the Stash scene made from the output (`result_scene_id`, which the queue page links a done job to) |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
-| GET | `/batch`, `/batch/check` | queue snapshot / environment checks for the plugin's *Check settings* task |
-| GET | `/queue` | the queue as a page for a phone or desktop browser: GPU load sparkline, running job, queued jobs with Remove and each source's duration, last finished ones with their log; refreshes every 5s |
+| GET | `/batch`, `/batch/check` | queue snapshot (`paused`, `paused_since`, `running`, `queued`, ...) / environment checks for the plugin's *Check settings* task |
+| POST | `/batch/pause` | start no more jobs; body `{"stop_running": true}` also kills the running Jasna and puts its job back at the head of the queue (progress lost) so the GPU is free at once. Persisted: a restarted bridge stays paused |
+| POST | `/batch/resume` | start jobs again (a job stopped by a pause runs first) |
+| GET | `/queue[?nodes=name = /jasna; name2 = /jasna-3060]` | the queue as a page for a phone or desktop browser: per bridge node its GPU load sparkline, status, Pause / Pause now / Resume, running job, queued jobs with Remove and each source's duration; the last finished ones of all nodes with their log; refreshes every 5s. `nodes` lists the bridges to show (same-origin reverse-proxy paths, or absolute URLs whose `cors_origins` allow this origin); without it the page shows the bridge serving it |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
 through Stash GraphQL (`findScene { files { path } }`) and applies the
@@ -255,6 +257,18 @@ optional `[[paths.map]]` rewrites.
   naming a model that is not downloaded fails at Jasna's download prompt,
   which `GET /batch/check` (and the plugin's *Check settings*) warns about
   for LTX.
+- **Pausing a node.** `POST /batch/pause` holds the queue: the running
+  job finishes and no other starts, until `POST /batch/resume`. With
+  `{"stop_running": true}` the running Jasna is killed as well and its
+  job goes back to the head of the queue (`head: true`, attempt not
+  counted, scratch discarded; Jasna cannot resume a run, so its progress
+  is lost), which frees the GPU for other work within seconds. An adopted
+  job (running from before a restart) is stopped the same way. The flag
+  is in the state file, so a restart keeps the pause; `/health` and
+  `/batch` report `paused` / `paused_since`, the plugin's *Sync* is run
+  with event `requeued`, and the jasna-batch plugin sends new jobs to
+  another node while this one is paused. The `/queue` page has the
+  buttons, one set per node.
 - **Output fix-up (audio and edit list).** Every finished file is probed
   on scratch before the move and repaired with one stream-copy ffmpeg
   pass (`-c:v copy`, `-map_metadata 0`, `+faststart`) when either applies.

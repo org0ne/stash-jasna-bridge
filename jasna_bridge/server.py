@@ -43,6 +43,8 @@ ROUTES = [
     ("GET", re.compile(r"^/queue$"), "queue_page", True),
     ("GET", re.compile(r"^/batch$"), "batch", True),
     ("GET", re.compile(r"^/batch/check$"), "batch_check", True),
+    ("POST", re.compile(r"^/batch/pause$"), "batch_pause", True),
+    ("POST", re.compile(r"^/batch/resume$"), "batch_resume", True),
     ("GET", re.compile(r"^/jobs$"), "jobs_list", True),
     ("POST", re.compile(r"^/jobs$"), "jobs_post", True),
     ("GET", re.compile(rf"^/jobs/{JOB_RE}$"), "job_get", True),
@@ -240,6 +242,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_batch_check(self):
         self.send_json(HTTPStatus.OK, self.jobs_or_404().check())
+
+    def h_batch_pause(self):
+        """Body {"stop_running": true} also stops the running job and puts
+        it back at the head of the queue (progress lost), freeing the GPU
+        now; without it the running job finishes and no other starts."""
+        body = self.read_json()
+        self.send_json(HTTPStatus.OK, {"batch": self.jobs_or_404().pause(bool(body.get("stop_running")))})
+
+    def h_batch_resume(self):
+        self.send_json(HTTPStatus.OK, {"batch": self.jobs_or_404().resume()})
 
     def h_jobs_list(self):
         jobs = self.jobs_or_404()

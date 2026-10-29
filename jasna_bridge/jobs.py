@@ -77,6 +77,7 @@ class Job:
     audio_result: dict | None = None     # {"from", "to", "channels", "bitrate", "seconds"} when that happened
     notes: list[str] = field(default_factory=list)
     pid: int | None = None   # Jasna's pid while running (so a restarted bridge can adopt it)
+    head: bool = False       # runs before older queued jobs (a job stopped by a pause goes back to the front)
     # Parsed from Jasna's progress bar in the log: {"percent", "eta_s", "rate", "detail", "updated"}
     progress: dict | None = None
 
@@ -108,6 +109,9 @@ class JobQueue:
         self.current: Job | None = None
         self.proc: subprocess.Popen | None = None
         self._cancel_requested: set[str] = set()
+        self._requeue_requested: set[str] = set()   # running jobs to stop and put back at the head (pause)
+        self.paused = False            # start no job while set; persisted with the queue
+        self.paused_since: float | None = None
         self._adopt: list[tuple[Job, int]] = []   # running jobs found alive at start, (job, pid)
         self._save_lock = threading.Lock()        # one writer of the state file at a time
         self._stop = threading.Event()
@@ -177,6 +181,8 @@ class JobQueue:
                 self._discard_scratch(job)
             self.jobs[job.id] = job
         self.stats.update({k: v for k, v in data.get("stats", {}).items() if k in self.stats})
+        self.paused = bool(data.get("paused"))
+        self.paused_since = data.get("paused_since") if self.paused else None
 
     def _save(self) -> None:
         with self.lock:
@@ -186,7 +192,8 @@ class JobQueue:
                 finished.sort(key=lambda j: (not j.ingested, j.finished or j.created))
                 for j in finished[: len(finished) - self.cfg.batch_keep_jobs]:
                     del self.jobs[j.id]
-            data = {"jobs": [asdict(j) for j in self.jobs.values()], "stats": dict(self.stats)}
+            data = {"jobs": [asdict(j) for j in self.jobs.values()], "stats": dict(self.stats),
+                    "paused": self.paused, "paused_since": self.paused_since}
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         tmp = self.state_file + ".tmp"
         with self._save_lock:
@@ -203,7 +210,7 @@ class JobQueue:
         with self.lock:
             out = [j for j in self.jobs.values()
                    if (states is None or j.state in states) and (not unacked_only or not j.ingested)]
-        return sorted(out, key=lambda j: j.created)
+        return sorted(out, key=lambda j: (not j.head, j.created))
 
     def queued(self) -> list[Job]:
         return self.list({"queued"})
@@ -213,6 +220,8 @@ class JobQueue:
             cur = self.current
             return {
                 "enabled": True,
+                "paused": self.paused,
+                "paused_since": self.paused_since,
                 "running": cur.brief() if cur else None,
                 "queued": len([j for j in self.jobs.values() if j.state == "queued"]),
                 "unacknowledged": len([j for j in self.jobs.values()
@@ -284,6 +293,51 @@ class JobQueue:
                     self._kill(proc)
                 return job
             raise JobError(f"job is already {job.state}", 409)
+
+    def pause(self, stop_running: bool = False) -> dict:
+        """Start no more jobs until resume(). With stop_running, also kill
+        the running Jasna and put its job back at the head of the queue
+        (its progress is lost: Jasna cannot resume a run), so the GPU is
+        free for other work at once. Returns the snapshot plus the id of
+        the job being stopped, if any."""
+        stopping = None
+        with self.lock:
+            if not self.paused:
+                self.paused, self.paused_since = True, time.time()
+                log.info("batch queue paused%s", " (stopping the running job)" if stop_running else "")
+            job, proc = self.current, self.proc
+            if stop_running and job is not None and job.state == "running" and job.id not in self._cancel_requested:
+                self._requeue_requested.add(job.id)
+                stopping = job.id
+                if proc is not None and proc.poll() is None:
+                    log.info("job %s: stopping for the pause, re-queued at the head", job.id)
+                    self._kill(proc)
+                # an adopted job (no proc) is stopped by its watcher thread
+        self._save()
+        return {**self.snapshot(), "stopping": stopping}
+
+    def resume(self) -> dict:
+        with self.lock:
+            if self.paused:
+                self.paused, self.paused_since = False, None
+                log.info("batch queue resumed (%d queued)", len([j for j in self.jobs.values() if j.state == "queued"]))
+        self._save()
+        self._wake.set()
+        return self.snapshot()
+
+    def _requeue(self, job: Job, note: str) -> None:
+        """A running job stopped on purpose goes back to the front of the
+        queue, as if it had never started."""
+        with self.lock:
+            job.state, job.started, job.finished, job.duration_s = "queued", None, None, None
+            job.exit_code, job.error, job.progress, job.pid, job.head = None, "", None, None, True
+            job.attempts = max(0, job.attempts - 1)   # a pause is not a failed attempt
+            job.notes.append(note)
+            if self.current is job:
+                self.current = None
+        self._save()
+        log.info("job %s: %s", job.id, note)
+        self._notify(job, "requeued")
 
     def ack(self, job_id: str, result_scene_id: str | None = None) -> Job:
         """The plugin has dealt with a finished job; result_scene_id is the
@@ -384,11 +438,9 @@ class JobQueue:
     def _loop(self) -> None:
         while not self._stop.is_set():
             job = None
-            with self.lock:
-                for j in self.jobs.values():
-                    if j.state == "queued":
-                        job = j
-                        break
+            if not self.paused:
+                queued = self.queued()   # head-of-queue jobs first, then by submission
+                job = queued[0] if queued else None
             if job is None or not self._acquire_gpu(job):
                 self._wake.wait(self.POLL_S)
                 self._wake.clear()
@@ -413,7 +465,7 @@ class JobQueue:
                *([] if cfg.batch_progress else ["--no-progress"]),
                *cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags]
         with self.lock:
-            job.state, job.started, job.attempts = "running", time.time(), job.attempts + 1
+            job.state, job.started, job.attempts, job.head = "running", time.time(), job.attempts + 1, False
             job.command, job.error, job.exit_code, job.progress, job.pid = cmd, "", None, None, None
             job.jasna_version = self.sessions.procs.version_string() if hasattr(self.sessions.procs, "version_string") else ""
             self.current = job
@@ -457,12 +509,17 @@ class JobQueue:
         with self.lock:
             self.proc = None
             cancelled = job.id in self._cancel_requested
+            requeue = job.id in self._requeue_requested and not cancelled
             self._cancel_requested.discard(job.id)
+            self._requeue_requested.discard(job.id)
         job.exit_code = proc.returncode
         shutil.rmtree(work, ignore_errors=True)
         if cancelled:
             self._discard(out_tmp)
             return self._finish(job, "cancelled", "cancelled while running")
+        if requeue:
+            self._discard(out_tmp)
+            return self._requeue(job, "stopped for a pause of the queue; runs first after resume")
         if timed_out:
             self._discard(out_tmp)
             return self._finish(job, "failed", f"killed after batch.job_timeout_h ({cfg.batch_job_timeout_h}h)")
@@ -552,8 +609,9 @@ class JobQueue:
             while self._is_job_process(pid, job):
                 if self._stop.is_set():
                     return  # another restart: still running, adopted again next time
-                if job.id in self._cancel_requested:
-                    log.info("job %s: cancel requested on an adopted job, killing pid %s", job.id, pid)
+                if job.id in self._cancel_requested or job.id in self._requeue_requested:
+                    log.info("job %s: %s requested on an adopted job, killing pid %s", job.id,
+                             "cancel" if job.id in self._cancel_requested else "stop for a pause", pid)
                     for sig in (signal.SIGTERM, signal.SIGKILL):
                         try:
                             os.killpg(pid, sig)
@@ -569,11 +627,16 @@ class JobQueue:
                 time.sleep(1.0)
             with self.lock:
                 cancelled = job.id in self._cancel_requested
+                requeue = job.id in self._requeue_requested and not cancelled
                 self._cancel_requested.discard(job.id)
+                self._requeue_requested.discard(job.id)
             shutil.rmtree(work, ignore_errors=True)
             if cancelled:
                 self._discard(out_tmp)
                 return self._finish(job, "cancelled", "cancelled while running (adopted)")
+            if requeue:
+                self._discard(out_tmp)
+                return self._requeue(job, "stopped for a pause of the queue (adopted); runs first after resume")
             job.notes.append("finished under a restarted bridge; exit code unknown, judged by the output file")
             self._finalize_output(job, out_tmp)
         except Exception as err:

@@ -1480,6 +1480,55 @@ class Batch(unittest.TestCase):
         st, body, _ = self.h.call("DELETE", f"/jobs/{a['job']['id']}")
         self.assertEqual(st, 409)
 
+    def test_pause_finishes_running_then_holds_until_resume(self):
+        st, a, _ = self.submit(flags=["--fake-delay", "0.6"])
+        st, b, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"))
+        self.wait_state(a["job"]["id"], {"running"})
+        st, body, _ = self.h.call("POST", "/batch/pause", {})
+        self.assertEqual(st, 200); self.assertTrue(body["batch"]["paused"]); self.assertIsNone(body["batch"]["stopping"])
+        self.wait_state(a["job"]["id"], {"done"})
+        time.sleep(1.0)
+        st, body, _ = self.h.call("GET", f"/jobs/{b['job']['id']}")
+        self.assertEqual(body["job"]["state"], "queued")          # not started while paused
+        st, body, _ = self.h.call("GET", "/health")
+        self.assertTrue(body["batch"]["paused"]); self.assertIsNotNone(body["batch"]["paused_since"])
+        # the pause is in the state file, so a restarted bridge stays paused
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, self.h.jobs.stash, self.h.jobs.map_path)
+        reloaded._load()
+        self.assertTrue(reloaded.paused); self.assertEqual(reloaded.paused_since, body["batch"]["paused_since"])
+        st, body, _ = self.h.call("POST", "/batch/resume")
+        self.assertEqual(st, 200); self.assertFalse(body["batch"]["paused"])
+        self.wait_state(b["job"]["id"], {"done"})
+
+    def test_pause_now_stops_the_running_job_and_requeues_it_first(self):
+        st, older, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"),
+                                   flags=["--fake-delay", "5"])
+        st, a, _ = self.submit(flags=["--fake-delay", "5"])
+        self.wait_state(older["job"]["id"], {"running"})
+        st, body, _ = self.h.call("DELETE", f"/jobs/{older['job']['id']}")   # a is now first
+        self.wait_state(a["job"]["id"], {"running"})
+        st, body, _ = self.h.call("POST", "/batch/pause", {"stop_running": True})
+        self.assertEqual(st, 200); self.assertEqual(body["batch"]["stopping"], a["job"]["id"])
+        job = self.wait_state(a["job"]["id"], {"queued", "cancelled", "failed"})
+        self.assertEqual(job["state"], "queued", job["error"])
+        self.assertTrue(job["head"]); self.assertEqual(job["attempts"], 0); self.assertIsNone(job["started"])
+        self.assertIn("stopped for a pause", job["notes"][-1])
+        self.assertIn("requeued", [t["args"].get("event") for t in self.tasks_seen() if "args" in t])
+        st, body, _ = self.h.call("GET", "/health")
+        self.assertIsNone(body["batch"]["running"]); self.assertIsNone(body["batch_job"])
+        self.assertEqual([f for f in os.listdir(self.h.jobs.scratch_dir) if f.endswith(".mp4")], [])
+        # a job submitted meanwhile waits behind the stopped one
+        st, c, _ = self.submit(preset="third", output_path=self.out.replace("LTX", "third"), flags=["--fake-delay", "0.2"])
+        st, body, _ = self.h.call("GET", "/jobs?state=queued")
+        self.assertEqual([j["id"] for j in body["jobs"]], [a["job"]["id"], c["job"]["id"]])
+        self.h.call("POST", "/batch/resume")
+        self.wait_state(a["job"]["id"], {"running"})
+        st, body, _ = self.h.call("GET", f"/jobs/{c['job']['id']}")
+        self.assertEqual(body["job"]["state"], "queued")
+        job = self.wait_state(a["job"]["id"], {"done", "failed"}, timeout=20)
+        self.assertEqual(job["state"], "done"); self.assertFalse(job["head"]); self.assertEqual(job["attempts"], 1)
+        self.wait_state(c["job"]["id"], {"done"})
+
     def test_failures_are_reported(self):
         st, body, _ = self.submit(flags=["--fake-fail", "3"])
         job = self.wait_state(body["job"]["id"], {"done", "failed"})

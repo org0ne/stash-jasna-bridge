@@ -41,6 +41,7 @@
   button { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line);
     background: var(--chip); color: var(--text); cursor: pointer; }
   button.danger { color: var(--bad); }
+  button.primary { color: var(--ok); }
   button:disabled { opacity: .5; cursor: default; }
   a.log { color: var(--muted); font-size: 13px; }
   .running .card { border-color: var(--run); }
@@ -61,7 +62,17 @@
   @keyframes pulse { 50% { opacity: .55; } }
   @media (max-width: 480px) { .passes { grid-template-columns: 1fr; } }
   .empty { color: var(--muted); padding: 6px 2px; }
-  .gpu { padding: 10px 14px 10px; margin-bottom: 14px; }
+  /* one block per bridge node */
+  .node { margin-bottom: 26px; }
+  .node-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 0 0 8px; }
+  .node-h h2 { margin: 0; font-size: 17px; letter-spacing: 0; text-transform: none; color: var(--text); }
+  .node-h .meta { flex-basis: 100%; }
+  .node-h .ctl { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .node.paused .card { opacity: .85; }
+  .node .h3 { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 14px 0 6px; }
+  .chip { display: inline-block; padding: 0 7px; border-radius: 6px; font-size: 11px; font-weight: 600; background: var(--chip);
+    color: var(--muted); vertical-align: 1px; margin-left: 4px; }
+  .gpu { padding: 10px 14px 10px; margin-bottom: 8px; }
   .gpu-h { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px;
     letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
   .gpu-h b { color: var(--text); font-size: 15px; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
@@ -75,6 +86,8 @@
   .gpu .bar i { background: var(--accent); }
   .gpu .bar i.w { background: var(--warn); } .gpu .bar i.f { background: var(--bad); }
   .gpu-m { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .jump a { color: var(--muted); text-decoration: none; border-bottom: 1px dotted var(--muted); margin-right: 10px; }
+  .more { margin: 2px 0 0; }
   .foot { margin-top: 24px; font-size: 12px; color: var(--muted); }
   .foot a { color: inherit; }
   @media (max-width: 480px) { .row { grid-template-columns: auto 1fr; } .row > button, .row > a.log { grid-column: 2; justify-self: start; } }
@@ -84,34 +97,51 @@
 <main>
   <header>
     <h1>Jasna queue</h1>
-    <span id="status" class="pill">loading</span>
-    <span id="meta" class="meta"></span>
+    <span id="clock" class="meta"></span>
+    <span id="jump" class="meta jump"></span>
   </header>
 
-  <section id="gpu" class="card gpu" hidden></section>
-
-  <section class="running">
-    <h2>Running</h2>
-    <div id="running"></div>
-  </section>
-
-  <section>
-    <h2>Queued <span id="qcount" class="meta"></span></h2>
-    <div id="queued"></div>
-  </section>
+  <div id="nodes"></div>
 
   <section>
     <h2>Finished <span id="fcount" class="meta"></span></h2>
     <div id="finished"></div>
   </section>
 
-  <p class="foot">stash-jasna-bridge <span id="version"></span> · refreshes every 5 s · <a href="jobs">raw JSON</a> · <a href="health">health</a></p>
+  <p class="foot" id="foot">stash-jasna-bridge · refreshes every 5 s</p>
 </main>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const scenes = {};            // scene id -> {title, duration} (from Stash GraphQL, same origin)
+
+  // The bridges shown: "?nodes=name = /jasna; name2 = /jasna-3060" (the
+  // jasna-batch plugin's settings link builds this from its node list; a
+  // URL may also be absolute when that origin allows this one in its
+  // cors_origins). Without it: the bridge serving this page, by relative
+  // paths, so any path_prefix works.
+  function parseNodes(text) {
+    const out = [];
+    for (const raw of String(text || "").split(/[;\n]/)) {
+      const entry = raw.trim();
+      if (!entry) continue;
+      let name = "", url = entry;
+      const m = entry.match(/^([^=]+?)\s*=\s*(\S.*)$/);
+      if (m && !/:\/\/|^\//.test(m[1].trim())) { name = m[1].trim(); url = m[2].trim(); }
+      url = url.split(/\s+/)[0].replace(/\/+$/, "");
+      if (!/:\/\/|^\//.test(url)) continue;
+      out.push({ name: name || url.replace(/^.*\//, "") || "bridge", base: url + "/", key: out.length });
+    }
+    return out;
+  }
+  const params = new URLSearchParams(location.search);
+  const NODES = parseNodes(params.get("nodes"));
+  if (!NODES.length) NODES.push({ name: "", base: "", key: 0 });
+  const multi = NODES.length > 1;
+  const state = {};             // node key -> {health, jobs, batch, error}
+  const QUEUE_FOLD = 5;         // queued jobs shown per node until "show all"
+  const expanded = new Set();   // node keys whose whole queue is shown
 
   const fmtDur = (s) => {
     if (s == null) return "";
@@ -152,19 +182,40 @@
   const originalLink = (j) => resultId(j)
     ? ` · <a class="orig" href="/scenes/${encodeURIComponent(j.scene_id)}" title="the scene this job was queued from">original</a>` : "";
 
-  async function api(path, opts) {
-    const r = await fetch(path, { credentials: "include", ...opts });
-    if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  async function api(node, path, opts) {
+    const r = await fetch(node.base + path, { credentials: "include", ...opts });
+    if (!r.ok) {
+      let detail = "";
+      try { detail = (await r.json()).error || ""; } catch (e) { /* not JSON */ }
+      throw new Error(`${node.name || "bridge"}: HTTP ${r.status}${detail ? " " + detail : ""}`);
+    }
     return r.json();
   }
+  const post = (node, path, body) => api(node, path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                       body: JSON.stringify(body || {}) });
 
-  async function cancel(id, state) {
-    const what = state === "running" ? "Stop the running job and discard its progress?" : "Remove this job from the queue?";
+  async function cancel(key, id, st) {
+    const what = st === "running" ? "Stop the running job and discard its progress?" : "Remove this job from the queue?";
     if (!confirm(what)) return;
-    try { await api(`jobs/${id}`, { method: "DELETE" }); } catch (e) { alert(e.message); }
+    try { await api(NODES[key], `jobs/${id}`, { method: "DELETE" }); } catch (e) { alert(e.message); }
     refresh();
   }
-  window.__cancel = cancel;
+  // Pause: finish the running job, start no other. Pause now: also stop the
+  // running job and put it back at the head of the queue (Jasna cannot
+  // resume a run, so its progress so far is lost) to free the GPU at once.
+  async function pause(key, stopRunning) {
+    const node = NODES[key], s = state[key] || {}, running = s.batch && s.batch.running;
+    if (stopRunning && running && !confirm(`Stop ${running.source || "the running job"} now and put it back at the head of ` +
+        `${node.name ? node.name + "'s" : "the"} queue? Its ${fmtDur(running.running_s)} of progress is lost.`)) return;
+    try { await post(node, "batch/pause", { stop_running: !!stopRunning }); } catch (e) { alert(e.message); }
+    refresh();
+  }
+  async function resume(key) {
+    try { await post(NODES[key], "batch/resume"); } catch (e) { alert(e.message); }
+    refresh();
+  }
+  function showAll(key) { expanded.add(key); $("nodes").innerHTML = NODES.map(renderNode).join(""); }
+  window.__cancel = cancel; window.__pause = pause; window.__resume = resume; window.__showAll = showAll;
 
   // Progress as one bar per pass: finished passes full, the current one
   // filled to Jasna's percent for it, the rest empty. Jasna's own bar
@@ -198,20 +249,22 @@
       <span class="sub prog">${esc(bits.join(" · "))}</span>`;
   }
 
-  function renderJob(j, pos) {
+  function renderJob(node, j, pos) {
     const st = j.state;
     const when = st === "running" ? `started ${fmtTime(j.started)} · running ${fmtDur(j.running_s)}`
                : st === "queued" ? `queued ${fmtTime(j.created)}`
                : `${fmtTime(j.finished)} · ${fmtDur(j.duration_s)}${j.output_bytes ? " · " + fmtGB(j.output_bytes) : ""}`;
     const cls = st === "done" ? "ok" : st === "running" ? "run" : st === "queued" ? "" : st === "failed" ? "bad" : "warn";
     const action = (st === "queued" || st === "running")
-      ? `<button class="danger" onclick="__cancel('${j.id}','${st}')">${st === "running" ? "Stop" : "Remove"}</button>`
-      : (j.log_file ? `<a class="log" href="jobs/${j.id}/log" target="_blank">log</a>` : "");
+      ? `<button class="danger" onclick="__cancel(${node.key},'${j.id}','${st}')">${st === "running" ? "Stop" : "Remove"}</button>`
+      : (j.log_file ? `<a class="log" href="${esc(node.base)}jobs/${j.id}/log" target="_blank">log</a>` : "");
+    const nodeChip = multi && pos == null && st !== "running" ? `<span class="chip">${esc(node.name)}</span>` : "";
+    const head = st === "queued" && j.head ? " · back at the head after a pause" : "";
     return `<div class="card"><div class="row">
       <span class="pos">${pos != null ? pos : `<span class="pill ${cls}">${esc(st)}</span>`}</span>
-      <span class="title">${sceneLink(j)}</span>
+      <span class="title">${sceneLink(j)}${nodeChip}</span>
       ${action}
-      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))}${duration(j) ? " · " + fmtClock(duration(j)) : ""} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}${originalLink(j)}</span>
+      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))}${duration(j) ? " · " + fmtClock(duration(j)) : ""} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}${esc(head)}${originalLink(j)}</span>
       ${j.error ? `<span class="err">${esc(j.error)}</span>` : ""}
       ${st === "running" ? progressBar(j) : ""}
     </div></div>`;
@@ -240,10 +293,9 @@
 
   // Whole-GPU load from the bridge's nvidia-smi sampler (health.gpu): a
   // utilization sparkline over the last few minutes, the VRAM bar and the
-  // card's name. Hidden where the bridge reports no GPU.
+  // card's name. Empty where the bridge reports no GPU.
   function renderGpu(g) {
-    const el = $("gpu");
-    if (!g || !g.mem_total) { el.hidden = true; return; }
+    if (!g || !g.mem_total) return "";
     const clamp = (v) => Math.max(0, Math.min(100, v));
     const h = (g.history || []).map(clamp);
     const gb = (m) => (m / 1024).toFixed(1);
@@ -259,49 +311,87 @@
         </svg><i class="dot" style="top:${100 - h[n - 1]}%"></i></div>`;
     }
     const span = g.interval_s && h.length > 1 ? `last ${fmtDur(g.interval_s * (h.length - 1))}` : "";
-    el.title = `${g.name || "GPU"}: ${g.util}% util, ${gb(g.mem_used)} / ${gb(g.mem_total)} GB VRAM` +
+    const title = `${g.name || "GPU"}: ${g.util}% util, ${gb(g.mem_used)} / ${gb(g.mem_total)} GB VRAM` +
       (g.sampled_ago != null ? ` (sampled ${Math.round(g.sampled_ago)}s ago)` : "");
-    el.innerHTML = `<div class="gpu-h"><span>GPU ${esc(span)}</span><b>${g.util}%</b></div>${spark}
+    return `<section class="card gpu" title="${esc(title)}"><div class="gpu-h"><span>GPU ${esc(span)}</span><b>${g.util}%</b></div>${spark}
       <div class="bar"><i class="${memCls}" style="width:${memPct}%"></i></div>
       <div class="gpu-m"><span>${gb(g.mem_used)} / ${gb(g.mem_total)} GB VRAM</span>
-        <span>${esc((g.name || "").replace(/^NVIDIA\s+/, ""))}</span></div>`;
-    el.hidden = false;
+        <span>${esc((g.name || "").replace(/^NVIDIA\s+/, ""))}</span></div></section>`;
+  }
+
+  // The node's status pill and its Pause / Pause now / Resume buttons.
+  function nodeHeader(node, s) {
+    const name = node.name ? esc(node.name) : "";
+    if (s.error) {
+      return `<div class="node-h"><h2>${name || "Bridge"}</h2><span class="pill bad">unreachable</span>
+        <span class="meta">${esc(s.error)}</span></div>`;
+    }
+    const health = s.health || {}, b = health.batch || {}, info = s.batch || {};
+    const running = s.jobs.filter((j) => j.state === "running"), queued = s.jobs.filter((j) => j.state === "queued");
+    const live = health.active ? "live stream active" : (health.stream && health.stream.path) ? "stream lingering" : "";
+    let text, cls;
+    if (!b.enabled) { text = "batch disabled"; cls = "bad"; }
+    else if (b.paused) { text = running.length ? "paused · finishing the running job" : "paused"; cls = "warn"; }
+    else if (running.length) { text = "processing"; cls = "run"; }
+    else if (queued.length) { text = live ? `waiting: ${live}` : "waiting for the GPU"; cls = "warn"; }
+    else { text = live || "idle"; cls = "ok"; }
+    const meta = [];
+    if (health.version) meta.push(`bridge ${health.version}`);
+    if (info.jasna_version) meta.push(`Jasna ${info.jasna_version}`);
+    if (b.scratch_free_gb != null) meta.push(`${Math.round(b.scratch_free_gb)} GB scratch free`);
+    if (b.paused && b.paused_since) meta.push(`paused since ${fmtTime(b.paused_since)}`);
+    if (live && b.paused) meta.push(live);
+    let ctl = "";
+    if (b.enabled) {
+      ctl = b.paused
+        ? `<button class="primary" onclick="__resume(${node.key})" title="Start queued jobs again">Resume</button>`
+        : `<button onclick="__pause(${node.key},false)" title="Let the running job finish, then start no other">Pause</button>` +
+          (running.length ? `<button class="danger" onclick="__pause(${node.key},true)" title="Stop the running job now (its progress is lost), put it back at the head of the queue, and start no other">Pause now</button>` : "");
+    }
+    return `<div class="node-h"><h2>${name || "Bridge"}</h2><span class="pill ${cls}">${esc(text)}</span>
+      <span class="ctl">${ctl}</span><span class="meta">${esc(meta.join(" · "))}</span></div>`;
+  }
+
+  function renderNode(node) {
+    const s = state[node.key] || { error: "loading" };
+    const paused = !s.error && s.health && s.health.batch && s.health.batch.paused;
+    let body = "";
+    if (!s.error) {
+      const running = s.jobs.filter((j) => j.state === "running"), queued = s.jobs.filter((j) => j.state === "queued");
+      const queuedRuntime = queued.reduce((t, j) => t + (duration(j) || 0), 0);
+      const fold = multi && !expanded.has(node.key) && queued.length > QUEUE_FOLD + 1;
+      const shown = fold ? queued.slice(0, QUEUE_FOLD) : queued, hidden = queued.length - shown.length;
+      body = renderGpu((s.health || {}).gpu) +
+        `<div class="h3">Running</div><section class="running">${running.length ? running.map((j) => renderJob(node, j)).join("") : `<div class="empty">nothing running</div>`}</section>
+         <div class="h3">Queued ${queued.length ? `(${queued.length}${queuedRuntime ? ` · ${fmtClock(queuedRuntime)} of video` : ""})` : ""}</div>
+         ${queued.length ? shown.map((j, i) => renderJob(node, j, i + 1)).join("") : `<div class="empty">queue is empty</div>`}
+         ${hidden ? `<button class="more" onclick="__showAll(${node.key})">Show all ${queued.length} queued (${hidden} more)</button>` : ""}`;
+    }
+    return `<section class="node${paused ? " paused" : ""}" id="node-${node.key}">${nodeHeader(node, s)}${body}</section>`;
+  }
+
+  async function fetchNode(node) {
+    try {
+      const [health, list, batch] = await Promise.all([api(node, "health"), api(node, "jobs"), api(node, "batch").catch(() => ({}))]);
+      state[node.key] = { health, jobs: list.jobs || [], batch };
+    } catch (e) {
+      state[node.key] = { error: e.message, jobs: [] };
+    }
   }
 
   async function refresh() {
-    try {
-      const [health, list, batchInfo] = await Promise.all([api("health"), api("jobs"), api("batch").catch(() => ({}))]);
-      const jobs = list.jobs || [];
-      const running = jobs.filter((j) => j.state === "running");
-      const queued = jobs.filter((j) => j.state === "queued");
-      const finished = jobs.filter((j) => !["running", "queued"].includes(j.state)).sort((a, b) => (b.finished || 0) - (a.finished || 0)).slice(0, 25);
-      await loadScenes(jobs.flatMap((j) => [j.scene_id, resultId(j)].filter(Boolean)));
-      renderGpu(health.gpu);
-
-      const b = health.batch || {};
-      const live = health.active ? "live stream active" : (health.stream && health.stream.path) ? "stream lingering" : "";
-      const s = $("status");
-      if (!b.enabled) { s.textContent = "batch disabled"; s.className = "pill bad"; }
-      else if (running.length) { s.textContent = "processing"; s.className = "pill run"; }
-      else if (queued.length) { s.textContent = live ? `waiting: ${live}` : "waiting for the GPU"; s.className = "pill warn"; }
-      else { s.textContent = live || "idle"; s.className = "pill ok"; }
-      const meta = [];
-      if (batchInfo.jasna_version) meta.push(`Jasna ${batchInfo.jasna_version}`);
-      if (b.scratch_free_gb != null) meta.push(`${Math.round(b.scratch_free_gb)} GB scratch free`);
-      meta.push(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-      $("meta").textContent = meta.join(" · ");
-      $("version").textContent = health.version || "";
-
-      $("running").innerHTML = running.length ? running.map((j) => renderJob(j)).join("") : `<div class="empty">nothing running</div>`;
-      $("queued").innerHTML = queued.length ? queued.map((j, i) => renderJob(j, i + 1)).join("") : `<div class="empty">queue is empty</div>`;
-      const queuedRuntime = queued.reduce((t, j) => t + (duration(j) || 0), 0);
-      $("qcount").textContent = queued.length ? `(${queued.length}${queuedRuntime ? ` · ${fmtClock(queuedRuntime)} of video` : ""})` : "";
-      $("finished").innerHTML = finished.length ? finished.map((j) => renderJob(j)).join("") : `<div class="empty">none yet</div>`;
-      $("fcount").textContent = finished.length ? `(last ${finished.length})` : "";
-    } catch (e) {
-      $("status").textContent = "bridge unreachable"; $("status").className = "pill bad";
-      $("meta").textContent = e.message;
-    }
+    await Promise.all(NODES.map(fetchNode));
+    const all = NODES.flatMap((n) => (state[n.key].jobs || []).map((j) => [n, j]));
+    await loadScenes(all.flatMap(([, j]) => [j.scene_id, resultId(j)].filter(Boolean)));
+    $("nodes").innerHTML = NODES.map(renderNode).join("");
+    $("jump").innerHTML = multi ? NODES.map((n) => `<a href="#node-${n.key}">${esc(n.name)}</a>`).join("") : "";
+    const finished = all.filter(([, j]) => !["running", "queued"].includes(j.state))
+      .sort((a, b) => (b[1].finished || 0) - (a[1].finished || 0)).slice(0, 25);
+    $("finished").innerHTML = finished.length ? finished.map(([n, j]) => renderJob(n, j)).join("") : `<div class="empty">none yet</div>`;
+    $("fcount").textContent = finished.length ? `(last ${finished.length}${multi ? ", all nodes" : ""})` : "";
+    $("clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const links = NODES.map((n) => `<a href="${esc(n.base)}jobs">${multi ? esc(n.name) + " " : ""}raw JSON</a> · <a href="${esc(n.base)}health">${multi ? esc(n.name) + " " : ""}health</a>`);
+    $("foot").innerHTML = `stash-jasna-bridge · refreshes every 5 s · ${links.join(" · ")}`;
   }
 
   refresh();

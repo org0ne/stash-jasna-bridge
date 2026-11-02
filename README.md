@@ -257,6 +257,13 @@ optional `[[paths.map]]` rewrites.
   naming a model that is not downloaded fails at Jasna's download prompt,
   which `GET /batch/check` (and the plugin's *Check settings*) warns about
   for LTX.
+- **Wrapping Jasna.** `batch.wrapper` is a command put in front of Jasna's
+  in every job, for work that must happen on the job's GPU turn. It gets
+  Jasna's whole command line and must end up exec'ing it; cancel, pause,
+  timeouts, adoption after a restart and removal of the working directory
+  treat it as Jasna. `<wrapper> --check` is run by `GET /batch/check`, and
+  `/batch` reports `wrapper` so the plugin can route around nodes without
+  one. jasna-batch's `jasna_batch_upscale.py` uses this for `-upscale`.
 - **Pausing a node.** `POST /batch/pause` holds the queue: the running
   job finishes and no other starts, until `POST /batch/resume`. With
   `{"stop_running": true}` the running Jasna is killed as well and its

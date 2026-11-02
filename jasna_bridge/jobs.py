@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -228,6 +229,7 @@ class JobQueue:
                                        if j.state in ("done", "failed") and not j.ingested]),
                 "scratch_dir": self.scratch_dir,
                 "scratch_free_gb": _free_gb(self.scratch_dir),
+                "wrapper": bool(self.cfg.batch_wrapper),
                 "stats": dict(self.stats),
             }
 
@@ -396,6 +398,13 @@ class JobQueue:
             mapped = self.map_path(root)
             add(f"output root {root}", os.path.isdir(mapped) and os.access(mapped, os.W_OK),
                 "writable" if os.path.isdir(mapped) and os.access(mapped, os.W_OK) else f"{mapped} not a writable directory")
+        if cfg.batch_wrapper:
+            try:
+                out = subprocess.run([*shlex.split(cfg.batch_wrapper), "--check"], capture_output=True, text=True,
+                                     timeout=30, stdin=subprocess.DEVNULL)
+                add("batch wrapper", out.returncode == 0, (out.stdout or out.stderr).strip()[:200])
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
+                add("batch wrapper", False, f"{cfg.batch_wrapper}: {err}")
         ffmpeg, ffprobe = audio_fix.find_tools(cfg.batch_ffmpeg)
         add("ffmpeg + ffprobe (audio fix-up)", bool(ffmpeg and ffprobe),
             f"{ffmpeg}, {ffprobe}" if ffmpeg and ffprobe else "not found; jobs asking for AAC audio keep Jasna's audio")
@@ -461,7 +470,8 @@ class JobQueue:
         out_tmp = os.path.join(self.scratch_dir, f"{job.id}{OUTPUT_EXT}")
         work = os.path.join(self.scratch_dir, f"work-{job.id}")
         job.log_file = os.path.join(self.log_dir, f"{job.id}.log")
-        cmd = [cfg.jasna_binary, "--input", job.source, "--output", out_tmp, "--working-directory", work,
+        cmd = [*shlex.split(cfg.batch_wrapper), cfg.jasna_binary,
+               "--input", job.source, "--output", out_tmp, "--working-directory", work,
                *([] if cfg.batch_progress else ["--no-progress"]),
                *cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags]
         with self.lock:

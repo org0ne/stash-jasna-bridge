@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1775,6 +1776,39 @@ class Batch(unittest.TestCase):
         self.assertTrue(labels[f"output root {self.out_root}"]["ok"])
         self.assertTrue(labels["Stash reachable from the bridge"]["ok"])
         self.assertIn("model_weights", labels)  # the fake has none; reported, not fatal to the call
+
+    def wrapper_script(self, check_exit=0):
+        path = os.path.join(self.tmp, "wrap.sh")
+        with open(path, "w") as fh:
+            fh.write(f'#!/bin/sh\nif [ "$1" = --check ]; then echo wrap ready; exit {check_exit}; fi\n'
+                     f'echo "wrapped $1" > "{self.tmp}/wrapped"\nexec "$@"\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def test_wrapper_runs_in_front_of_jasna(self):
+        self.h.cfg.batch_wrapper = shlex.quote(self.wrapper_script())
+        st, body, _ = self.submit()
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "done", job["error"])
+        self.assertEqual(job["command"][0], os.path.join(self.tmp, "wrap.sh"))
+        with open(os.path.join(self.tmp, "wrapped")) as fh:
+            self.assertEqual(fh.read().strip(), f"wrapped {self.h.cfg.jasna_binary}")
+
+    def test_wrapper_is_reported(self):
+        st, body, _ = self.h.call("GET", "/batch")
+        self.assertFalse(body["wrapper"])
+        st, body, _ = self.h.call("GET", "/batch/check")
+        self.assertNotIn("batch wrapper", {c["label"] for c in body["checks"]})
+        self.h.cfg.batch_wrapper = shlex.quote(self.wrapper_script())
+        st, body, _ = self.h.call("GET", "/batch")
+        self.assertTrue(body["wrapper"])
+        st, body, _ = self.h.call("GET", "/batch/check")
+        labels = {c["label"]: c for c in body["checks"]}
+        self.assertTrue(labels["batch wrapper"]["ok"]); self.assertEqual(labels["batch wrapper"]["detail"], "wrap ready")
+        self.h.cfg.batch_wrapper = shlex.quote(self.wrapper_script(check_exit=1))
+        st, body, _ = self.h.call("GET", "/batch/check")
+        self.assertFalse({c["label"]: c for c in body["checks"]}["batch wrapper"]["ok"])
 
     def test_interrupted_job_is_requeued_on_restart(self):
         st, body, _ = self.submit(flags=["--fake-delay", "5"])

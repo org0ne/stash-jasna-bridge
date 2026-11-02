@@ -86,6 +86,8 @@ min_free_gb = 20            # a job is refused when scratch or the output volume
 grace_s = 120               # wait this long after the last live session ends before a job takes the GPU
 job_timeout_h = 0           # kill a job running longer than this; 0 = no limit (LTX presets can take many hours)
 common_flags = []           # added to every job after jasna.common_flags, e.g. ["--retarget-high-fps"]
+wrapper = ""                # command put in front of Jasna's in every job; it gets Jasna's command line and must
+                            #   end up exec'ing it. The plugin's jasna_batch_upscale.py uses this for -upscale
 output_roots = []           # Stash-side prefixes an output_path must be under, e.g. ["/media/Sorted/LTX"]; [] = any
 notify_plugin = "jasna-batch"  # Stash plugin + task run on every job state change, so the scene's
 notify_task = "Sync jobs"      #   status tag follows the job ("" turns the callback off)

@@ -103,6 +103,7 @@ class Config:
     batch_grace_s: float = 120.0     # wait this long after the last live session ends before taking the GPU
     batch_job_timeout_h: float = 0.0 # kill a job running longer than this; 0 = no limit
     batch_common_flags: list[str] = field(default_factory=list)  # added to every batch run after jasna.common_flags
+    batch_wrapper: str = ""          # command put in front of Jasna's in batch runs; it must end up running Jasna
     batch_output_roots: list[str] = field(default_factory=list)  # Stash-side prefixes an output path must be under; [] = any
     batch_notify_plugin: str = "jasna-batch"   # Stash plugin whose task is run on every job state change
     batch_notify_task: str = "Sync jobs"       # ("" disables the callback; the plugin's own Sync task sweeps instead)
@@ -264,6 +265,7 @@ def from_dict(data: dict) -> Config:
     cfg.batch_grace_s = _get(batch, "grace_s", cfg.batch_grace_s)
     cfg.batch_job_timeout_h = _get(batch, "job_timeout_h", cfg.batch_job_timeout_h)
     cfg.batch_common_flags = list(_get(batch, "common_flags", []))
+    cfg.batch_wrapper = _get(batch, "wrapper", cfg.batch_wrapper)
     cfg.batch_output_roots = [str(r).rstrip("/") for r in _get(batch, "output_roots", []) if str(r).strip()]
     cfg.batch_notify_plugin = _get(batch, "notify_plugin", cfg.batch_notify_plugin)
     cfg.batch_notify_task = _get(batch, "notify_task", cfg.batch_notify_task)

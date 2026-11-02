@@ -167,6 +167,8 @@
     return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
   };
   const duration = (j) => (scenes[j.scene_id] || {}).duration;
+  // Of the scene the title links to, so a done upscale shows its new height.
+  const height = (j) => (scenes[resultId(j) || j.scene_id] || {}).height;
 
   // A done job's title goes to the scene made from its output (the plugin
   // reports it on ack); everything else, and a done job the plugin has not
@@ -264,7 +266,7 @@
       <span class="pos">${pos != null ? pos : `<span class="pill ${cls}">${esc(st)}</span>`}</span>
       <span class="title">${sceneLink(j)}${nodeChip}</span>
       ${action}
-      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))}${duration(j) ? " · " + fmtClock(duration(j)) : ""} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}${esc(head)}${originalLink(j)}</span>
+      <span class="sub"><b>${esc(j.preset)}</b> · ${esc(base(j))}${duration(j) ? " · " + fmtClock(duration(j)) : ""}${height(j) ? ` · ${height(j)}p` : ""} · ${esc(when)}${st === "done" && !j.ingested ? " · waiting for Stash to ingest" : ""}${esc(head)}${originalLink(j)}</span>
       ${j.error ? `<span class="err">${esc(j.error)}</span>` : ""}
       ${st === "running" ? progressBar(j) : ""}
     </div></div>`;
@@ -277,7 +279,7 @@
     const missing = [...new Set(ids)].filter((id) => /^\d+$/.test(id) && !(id in scenes));
     if (!missing.length) return;
     try {
-      const q = "{ " + missing.map((id, i) => `s${i}: findScene(id:"${id}") { title files { duration } }`).join(" ") + " }";
+      const q = "{ " + missing.map((id, i) => `s${i}: findScene(id:"${id}") { title files { duration height } }`).join(" ") + " }";
       const r = await fetch("/graphql", {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q }),
@@ -286,7 +288,7 @@
       missing.forEach((id, i) => {
         const s = d.data && d.data[`s${i}`];
         const f = s ? (s.files || []).find((x) => x && x.duration) || {} : {};
-        scenes[id] = s ? { title: s.title || "", duration: f.duration || null } : {};
+        scenes[id] = s ? { title: s.title || "", duration: f.duration || null, height: f.height || null } : {};
       });
     } catch (e) { for (const id of missing) scenes[id] = {}; }
   }

@@ -79,12 +79,13 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | POST | `/jobs` | `{scene_id, file_path, output_path, preset, flags}` → **201** `{job, position}`; **409** when the same file+preset is already queued or running; **403** outside `batch.output_roots`. Batch jobs, see below |
 | GET | `/jobs[?state=queued,running&unacknowledged=1]` | job list |
 | GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
+| POST | `/jobs/{id}/move` | `{"before": "<job id>"}` or `{"after": "<job id>"}`: put a queued job next to another queued job → `{job, queued}` (the new order); **409** when either is not queued. Persisted |
 | POST | `/jobs/{id}/ack` | the plugin has ingested the result; optional body `{"scene_id"}` = the Stash scene made from the output (`result_scene_id`, which the queue page links a done job to) |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
 | GET | `/batch`, `/batch/check` | queue snapshot (`paused`, `paused_since`, `running`, `queued`, ...) / environment checks for the plugin's *Check settings* task |
 | POST | `/batch/pause` | start no more jobs; body `{"stop_running": true}` also kills the running Jasna and puts its job back at the head of the queue (progress lost) so the GPU is free at once. Persisted: a restarted bridge stays paused |
 | POST | `/batch/resume` | start jobs again (a job stopped by a pause runs first) |
-| GET | `/queue[?nodes=name = /jasna; name2 = /jasna-3060]` | the queue as a page for a phone or desktop browser: per bridge node its GPU load sparkline, status, Pause / Pause now / Resume, running job, queued jobs with Remove and each source's duration; the last finished ones of all nodes with their log; refreshes every 5s. `nodes` lists the bridges to show (same-origin reverse-proxy paths, or absolute URLs whose `cors_origins` allow this origin); without it the page shows the bridge serving it |
+| GET | `/queue[?nodes=name = /jasna; name2 = /jasna-3060]` | the queue as a page for a phone or desktop browser: per bridge node its GPU load sparkline, status, Pause / Pause now / Resume, running job, queued jobs with Remove and each source's duration, dragged by their position number to reorder them (mouse or touch) or sent to the front with *Top*; the last finished ones of all nodes with their log; refreshes every 5s. `nodes` lists the bridges to show (same-origin reverse-proxy paths, or absolute URLs whose `cors_origins` allow this origin); without it the page shows the bridge serving it |
 
 The browser never sends filesystem paths: the bridge resolves `scene_id`
 through Stash GraphQL (`findScene { files { path } }`) and applies the
@@ -276,6 +277,12 @@ optional `[[paths.map]]` rewrites.
   with event `requeued`, and the jasna-batch plugin sends new jobs to
   another node while this one is paused. The `/queue` page has the
   buttons, one set per node.
+- **Queue order.** Jobs run lowest `rank` first; a job's rank is its
+  submission time until `POST /jobs/{id}/move` (the `/queue` page's
+  drag) renumbers the queued jobs 0, 1, 2 ..., so later submissions still
+  go to the end. A job stopped by *Pause now* gets a rank below every
+  queued job. A state file from before 0.6.0 (no ranks) keeps its old
+  order: head-of-queue jobs first, then by submission.
 - **Output fix-up (audio and edit list).** Every finished file is probed
   on scratch before the move and repaired with one stream-copy ffmpeg
   pass (`-c:v copy`, `-map_metadata 0`, `+faststart`) when either applies.

@@ -308,6 +308,19 @@ class SessionFlow(unittest.TestCase):
         st, _, _ = self.h.call("DELETE", "/session")
         self.assertEqual(st, 405)
 
+    def test_unread_body_closes_the_connection(self):
+        # A POST answered without reading its body (404 here) must not leave
+        # the body to be parsed as the next request on a keep-alive connection.
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.h.server.server_address[1], timeout=5)
+        conn.request("POST", "/graphql", body=b'{"query": "{ x }"}', headers={"Content-Type": "application/json"})
+        resp = conn.getresponse(); resp.read()
+        self.assertEqual(resp.status, 404); self.assertEqual(resp.getheader("Connection"), "close")
+        conn.request("GET", "/jasna/health")   # http.client reconnects after a close
+        resp = conn.getresponse(); resp.read()
+        self.assertEqual(resp.status, 200)
+        conn.close()
+
     def test_prefix_optional_and_cors(self):
         st, body, _ = self.h.call("GET", "/health", prefix="")
         self.assertEqual(st, 200); self.assertTrue(body["jasna"]["reachable"])
@@ -1530,6 +1543,55 @@ class Batch(unittest.TestCase):
         self.assertEqual(job["state"], "done"); self.assertFalse(job["head"]); self.assertEqual(job["attempts"], 1)
         self.wait_state(c["job"]["id"], {"done"})
 
+    def test_move_reorders_the_queue(self):
+        self.h.call("POST", "/batch/pause", {})
+        ids = []
+        for name in ("a", "b", "c", "d"):
+            st, body, _ = self.submit(preset=name, output_path=self.out.replace("LTX", name))
+            self.assertEqual(st, 201, body)
+            ids.append(body["job"]["id"])
+        a, b, c, d = ids
+        queued = lambda: [j["id"] for j in self.h.call("GET", "/jobs?state=queued")[1]["jobs"]]
+        st, body, _ = self.h.call("POST", f"/jobs/{c}/move", {"before": a})
+        self.assertEqual(st, 200, body); self.assertEqual(body["queued"], [c, a, b, d])
+        st, body, _ = self.h.call("POST", f"/jobs/{c}/move", {"after": d})
+        self.assertEqual(body["queued"], [a, b, d, c]); self.assertEqual(queued(), [a, b, d, c])
+        # a job submitted after moves still goes to the end
+        st, e, _ = self.submit(preset="e", output_path=self.out.replace("LTX", "e"))
+        self.assertEqual(queued(), [a, b, d, c, e["job"]["id"]])
+        self.h.call("DELETE", f"/jobs/{e['job']['id']}")
+        for bad, code in (({}, 400), ({"before": a, "after": b}, 400), ({"before": "0" * 12}, 404)):
+            st, body, _ = self.h.call("POST", f"/jobs/{a}/move", bad)
+            self.assertEqual(st, code, (bad, body))
+        st, body, _ = self.h.call("POST", f"/jobs/{a}/move", {"before": e["job"]["id"]})   # cancelled anchor
+        self.assertEqual(st, 409, body)
+        # the order is in the state file
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, None, lambda p: p)
+        reloaded._load()
+        self.assertEqual([j.id for j in reloaded.queued()], [a, b, d, c])
+        # and the worker follows it
+        self.h.call("POST", f"/jobs/{d}/move", {"before": a})
+        self.h.call("POST", "/batch/resume")
+        started = {}
+        for j in (d, a, b, c):
+            started[j] = self.wait_state(j, {"done"})["started"]
+        self.assertEqual(sorted(started, key=started.get), [d, a, b, c])
+        st, body, _ = self.h.call("POST", f"/jobs/{d}/move", {"before": a})
+        self.assertEqual(st, 409, body)   # finished jobs are not movable
+
+    def test_queue_order_from_an_older_state_file(self):
+        # Before ranks: a job put back by a pause (head) first, then by submission.
+        self.h.jobs.shutdown()
+        jobs = [{"id": f"{n:012x}", "scene_id": "9", "stash_source": self.src, "source": self.src,
+                 "stash_output": self.out, "output": self.out, "preset": f"p{n}", "state": "queued",
+                 "created": 1000.0 + n, "head": n == 3} for n in (1, 2, 3)]
+        with open(self.h.jobs.state_file, "w") as fh:
+            json.dump({"jobs": jobs}, fh)
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, None, lambda p: p)
+        reloaded._load()
+        self.assertEqual([j.id for j in reloaded.queued()], [f"{n:012x}" for n in (3, 1, 2)])
+        self.h.jobs = None
+
     def test_failures_are_reported(self):
         st, body, _ = self.submit(flags=["--fake-fail", "3"])
         job = self.wait_state(body["job"]["id"], {"done", "failed"})
@@ -1651,6 +1713,8 @@ class Batch(unittest.TestCase):
         self.assertIn(b'"reading the source file"', body)
         self.assertIn(b'j.result_scene_id', body)        # a done job links to the scene made from its output
         self.assertIn(b'api(node, "jobs")', body)       # relative, so the path prefix does not matter
+        self.assertIn(b'`jobs/${id}/move`', body)       # queued jobs are dragged into a new order
+        self.assertIn(b'__toTop(', body)                 # or sent to the top with one button
         plain = BridgeHarness()
         try:
             st, body, _ = plain.call("GET", "/queue")

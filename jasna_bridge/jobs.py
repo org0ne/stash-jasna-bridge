@@ -78,9 +78,14 @@ class Job:
     audio_result: dict | None = None     # {"from", "to", "channels", "bitrate", "seconds"} when that happened
     notes: list[str] = field(default_factory=list)
     pid: int | None = None   # Jasna's pid while running (so a restarted bridge can adopt it)
-    head: bool = False       # runs before older queued jobs (a job stopped by a pause goes back to the front)
+    head: bool = False       # put back at the front by a pause (shown on the queue page)
+    rank: float | None = None   # queue order, lowest runs first: submission time until moved (move())
     # Parsed from Jasna's progress bar in the log: {"percent", "eta_s", "rate", "detail", "updated"}
     progress: dict | None = None
+
+    def __post_init__(self):
+        if self.rank is None:
+            self.rank = self.created
 
     def public(self) -> dict:
         d = asdict(self)
@@ -156,7 +161,9 @@ class JobQueue:
             log.warning("cannot read %s: %s (starting with an empty queue)", self.state_file, err)
             return
         fields = {f for f in Job.__dataclass_fields__}
+        unranked = False
         for raw in data.get("jobs", []):
+            unranked = unranked or "rank" not in raw
             try:
                 job = Job(**{k: v for k, v in raw.items() if k in fields})
             except TypeError as err:
@@ -181,6 +188,10 @@ class JobQueue:
                     job.notes.append("interrupted by a bridge restart; re-queued")
                 self._discard_scratch(job)
             self.jobs[job.id] = job
+        if unranked:
+            # A state file from before 0.6.0 ordered by (head first, submission).
+            old = sorted((j for j in self.jobs.values() if j.state == "queued"), key=lambda j: (not j.head, j.created))
+            self._renumber(old)
         self.stats.update({k: v for k, v in data.get("stats", {}).items() if k in self.stats})
         self.paused = bool(data.get("paused"))
         self.paused_since = data.get("paused_since") if self.paused else None
@@ -211,7 +222,7 @@ class JobQueue:
         with self.lock:
             out = [j for j in self.jobs.values()
                    if (states is None or j.state in states) and (not unacked_only or not j.ingested)]
-        return sorted(out, key=lambda j: (not j.head, j.created))
+        return sorted(out, key=lambda j: (j.rank, j.created))
 
     def queued(self) -> list[Job]:
         return self.list({"queued"})
@@ -296,6 +307,41 @@ class JobQueue:
                 return job
             raise JobError(f"job is already {job.state}", 409)
 
+    def move(self, job_id: str, before: str | None = None, after: str | None = None) -> Job:
+        """Put a queued job just before or just after another queued job
+        (the queue page's drag). Anchoring on a job, not a position, keeps
+        the drop right when the queue changed while the user dragged."""
+        if bool(before) == bool(after):
+            raise JobError("give one of before or after: the id of another queued job")
+        anchor_id = before or after
+        with self.lock:
+            job, anchor = self.jobs.get(job_id), self.jobs.get(anchor_id)
+            if job is None or anchor is None:
+                raise JobError("no such job", 404)
+            for j in (job, anchor):
+                if j.state != "queued":
+                    raise JobError(f"job {j.id} is {j.state}; only queued jobs can be moved", 409)
+            if job is anchor:
+                return job
+            order = [j for j in self.queued() if j is not job]
+            at = order.index(anchor) + (0 if before else 1)
+            order.insert(at, job)
+            self._renumber(order)
+            for j in order[1:] if order[0].head else order:
+                j.head = False   # "back at the head after a pause" holds only while it is first
+            position = at + 1
+        self._save()
+        log.info("job %s: moved to position %d of %d", job.id, position, len(order))
+        self._wake.set()
+        return job
+
+    @staticmethod
+    def _renumber(order: list[Job]) -> None:
+        """Ranks 0, 1, 2 ... in the given order: below any submission time,
+        so jobs submitted later still go to the end."""
+        for i, j in enumerate(order):
+            j.rank = float(i)
+
     def pause(self, stop_running: bool = False) -> dict:
         """Start no more jobs until resume(). With stop_running, also kill
         the running Jasna and put its job back at the head of the queue
@@ -334,6 +380,8 @@ class JobQueue:
             job.state, job.started, job.finished, job.duration_s = "queued", None, None, None
             job.exit_code, job.error, job.progress, job.pid, job.head = None, "", None, None, True
             job.attempts = max(0, job.attempts - 1)   # a pause is not a failed attempt
+            job.rank = min((j.rank for j in self.jobs.values() if j.state == "queued" and j is not job),
+                           default=job.rank) - 1
             job.notes.append(note)
             if self.current is job:
                 self.current = None

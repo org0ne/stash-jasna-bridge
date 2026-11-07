@@ -50,6 +50,7 @@ ROUTES = [
     ("GET", re.compile(rf"^/jobs/{JOB_RE}$"), "job_get", True),
     ("DELETE", re.compile(rf"^/jobs/{JOB_RE}$"), "job_delete", True),
     ("POST", re.compile(rf"^/jobs/{JOB_RE}/ack$"), "job_ack", True),
+    ("POST", re.compile(rf"^/jobs/{JOB_RE}/move$"), "job_move", True),
     ("GET", re.compile(rf"^/jobs/{JOB_RE}/log$"), "job_log", True),
 ]
 
@@ -109,6 +110,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def send(self, status: int, body: bytes = b"", content_type: str = "application/json", extra: dict | None = None):
         self.send_response(status)
+        if int(self.headers.get("Content-Length") or 0) > 0 and not getattr(self, "_body_read", False):
+            # An answer without reading the request's body (a 404, a 401):
+            # the body would be parsed as the next request on this connection.
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -131,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
         if length > 65536:
             raise ValueError("body too large")
         raw = self.rfile.read(length)
+        self._body_read = True
         if not raw.strip():
             return {}
         data = json.loads(raw.decode())
@@ -167,6 +174,7 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch("DELETE")
 
     def dispatch(self, method: str):
+        self._body_read = False   # one handler serves every request of a keep-alive connection
         path = self.route_path()
         methods_here = set()
         for m, pattern, name, needs_auth in ROUTES:
@@ -294,6 +302,14 @@ class Handler(BaseHTTPRequestHandler):
         body = self.read_json()   # optional {"scene_id": "<new Stash scene>"}
         job = self.jobs_or_404().ack(job_id, body.get("scene_id"))
         self.send_json(HTTPStatus.OK, {"job": job.public()})
+
+    def h_job_move(self, job_id: str):
+        """Body {"before": "<job id>"} or {"after": "<job id>"}: another
+        queued job to put this one next to. Answers the new queue order."""
+        jobs = self.jobs_or_404()
+        body = self.read_json()
+        job = jobs.move(job_id, str(body.get("before") or "") or None, str(body.get("after") or "") or None)
+        self.send_json(HTTPStatus.OK, {"job": job.public(), "queued": [j.id for j in jobs.queued()]})
 
     def h_job_log(self, job_id: str):
         text = self.jobs_or_404().log_tail(job_id)

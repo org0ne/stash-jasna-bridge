@@ -1646,9 +1646,11 @@ class Batch(unittest.TestCase):
         self.assertIn(b"Jasna queue", body)
         self.assertIn(b'fetch("/graphql"', body)       # scene titles from Stash on the same origin
         self.assertIn(b'findScene(id:', body)           # one alias per scene: a deleted scene must not blank the rest
-        self.assertIn(b'Pass ${cur} of ${total}', body)  # the running job says which pass it is in
+        self.assertIn(b'"Pass"} ${cur} of ${total}', body)  # the running job says which pass it is in
+        self.assertIn(b'Upscale before Jasna', body)     # and that an upscale runs first, reading the source
+        self.assertIn(b'"reading the source file"', body)
         self.assertIn(b'j.result_scene_id', body)        # a done job links to the scene made from its output
-        self.assertIn(b'api("jobs")', body)             # relative, so the path prefix does not matter
+        self.assertIn(b'api(node, "jobs")', body)       # relative, so the path prefix does not matter
         plain = BridgeHarness()
         try:
             st, body, _ = plain.call("GET", "/queue")

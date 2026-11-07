@@ -224,26 +224,37 @@
   // restarts for each pass, so this is the honest shape of the run. An LTX
   // job always makes 4 passes (scan, encode, denoise, compose), so an LTX
   // job that has not printed a bar yet already shows 4 empty segments; a
-  // job whose bars carry no pass label gets a single segment.
+  // job whose bars carry no pass label gets a single segment. A batch.wrapper
+  // upscale runs first, as its own two steps ("Upscale 1/2 read", "Upscale
+  // 2/2 <mode>"): reading the whole source once to index it takes minutes on
+  // a long film with nothing else to show, so it is named.
   const LTX_STAGES = ["scan", "encode", "denoise", "compose"];
+  const UPSCALE_STAGES = ["reading the source file", "upscaling"];
   const isLtx = (j) => (j.flags || []).some((f, i, a) => a[i - 1] === "--restoration-model-name" && /^ltx/i.test(f));
+  const isUpscale = (j) => (j.flags || []).some((f) => f === "--upscale" || f === "-upscale");
   function progressBar(j) {
     const p = j.progress || {};
     const pct = p.percent;
-    const total = p.passes || (isLtx(j) ? LTX_STAGES.length : 1);
+    const upscaling = /^upscale\b/i.test(p.label || "") || (pct == null && isUpscale(j));
+    const names = upscaling ? UPSCALE_STAGES : LTX_STAGES;
+    const total = p.passes || (upscaling ? UPSCALE_STAGES.length : isLtx(j) ? LTX_STAGES.length : 1);
     const cur = p.pass || (pct != null ? 1 : 0);
     const steps = Array.from({ length: total }, (_, i) => {
       const n = i + 1;
       const fill = n < cur ? 100 : n === cur && pct != null ? pct : 0;
-      const name = total === LTX_STAGES.length ? `: ${LTX_STAGES[i]}` : "";
-      return `<i class="${n < cur ? "done" : n === cur ? "now" : ""}" title="pass ${n}${name}"><b style="width:${fill}%"></b></i>`;
+      const name = total === names.length ? `: ${names[i]}` : "";
+      return `<i class="${n < cur ? "done" : n === cur ? "now" : ""}" title="${upscaling ? "step" : "pass"} ${n}${name}"><b style="width:${fill}%"></b></i>`;
     }).join("");
-    const label = total > 1
-      ? (cur ? `Pass ${cur} of ${total}${p.stage ? ` <span>· ${esc(p.stage)}</span>` : ""}` : `${total} passes <span>· preparing</span>`)
+    const upscaleStep = p.stage === "read" ? UPSCALE_STAGES[0] : UPSCALE_STAGES[1];
+    const label = upscaling
+      ? `Upscale before Jasna <span>· ${cur ? `step ${cur} of ${total} · ${upscaleStep}` : "starting"}</span>`
+      : total > 1
+      ? (cur ? `${isUpscale(j) ? "Jasna pass" : "Pass"} ${cur} of ${total}${p.stage ? ` <span>· ${esc(p.stage)}</span>` : ""}`
+             : `${total} passes <span>· preparing</span>`)
       : "";
     const bits = pct == null ? ["progress not reported yet"] : [`${pct}%`];
     if (pct != null) {
-      if (p.eta_s != null) bits.push(cur && total > 1 ? `pass ETA ${fmtDur(p.eta_s)}` : `ETA ${fmtDur(p.eta_s)}`);
+      if (p.eta_s != null) bits.push(cur && total > 1 ? `${upscaling ? "step" : "pass"} ETA ${fmtDur(p.eta_s)}` : `ETA ${fmtDur(p.eta_s)}`);
       if (p.run_left_s != null) bits.push(`${fmtDur(p.run_left_s)} left in all`);
       if (p.rate) bits.push(p.rate);
     }

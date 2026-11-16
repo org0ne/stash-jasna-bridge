@@ -283,9 +283,10 @@ optional `[[paths.map]]` rewrites.
   go to the end. A job stopped by *Pause now* gets a rank below every
   queued job. A state file from before 0.6.0 (no ranks) keeps its old
   order: head-of-queue jobs first, then by submission.
-- **Output fix-up (audio and edit list).** Every finished file is probed
-  on scratch before the move and repaired with one stream-copy ffmpeg
-  pass (`-c:v copy`, `-map_metadata 0`, `+faststart`) when either applies.
+- **Output fix-up (audio, edit list, colour tag).** Every finished file is
+  probed on scratch before the move and repaired with one stream-copy
+  ffmpeg pass (`-c:v copy`, `-map_metadata 0`, `+faststart`) when any of
+  these applies.
   *Audio:* Jasna copies the source's audio stream, so an MP3 or AC3
   source becomes an MP4 with MP3 or AC3 audio, which browsers will not
   play; a job submitted with `audio: "aac"` (the plugin's *Audio codec*
@@ -296,11 +297,27 @@ optional `[[paths.map]]` rewrites.
   constant ~100 ms off the audio; ffprobe warns about it ("Missing key
   frame while searching for timestamp" / "Cannot find an index entry
   before timestamp") in a fraction of a second, and the remux writes a
-  clean one. The job records `audio_result` (`edit_list`, `seconds`, and
+  clean one. *Colour tag:* for a source with no colour matrix tag, Jasna
+  0.12.3 tags its output BT.709 even at SD sizes, while the pixels keep
+  the source's BT.601 values, so players show SD restores warm and red.
+  When the source is untagged and under 720 lines and the output says
+  BT.709, the tag is rewritten to BT.601 (`h264_metadata`/`hevc_metadata`
+  and the container's tags; no pixel changes). An upscale preset's
+  output is already tagged BT.601 by the wrapper and is left alone. The
+  job records `audio_result` (`edit_list`, `colour`, `seconds`, and
   `from`/`to` when the audio changed) and a note per fix; a file that
-  needs neither is left byte-identical. A failed fix-up keeps Jasna's
+  needs none is left byte-identical. A failed fix-up keeps Jasna's
   file and notes why. `batch.ffmpeg` names the binary when it is not on
   PATH; `GET /batch/check` reports it.
+- **`--retarget-high-fps` and mislabelled frame rates.** Jasna goes by
+  the container's frame rate, and with this flag keeps every other frame
+  of a 50-60 fps source. WMVs with 1 ms timestamps (and some others) say
+  59.94 fps while their frames come at 29.97, so Jasna would halve them.
+  Before a job starts, the bridge measures the rate of the first two
+  minutes of the source's packets; when the container says 47 fps or more
+  but the frames come at under two thirds of that, the flag is left out
+  of the command and the job gets a note. Without it Jasna keeps every
+  frame and the source's timing.
 - **Progress and restarts.** Jobs run with Jasna's progress bar on
   (`batch.progress`); the bridge reads its last update from the job log
   every 3s and reports `progress: {percent, eta_s, rate, pass, passes,

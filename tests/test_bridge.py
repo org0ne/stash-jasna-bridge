@@ -1778,6 +1778,63 @@ class Batch(unittest.TestCase):
         st, body, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"), audio="opus")
         self.assertEqual(st, 400, body)
 
+    def test_untagged_sd_output_is_retagged_bt601(self):
+        from jasna_bridge import audio
+        ffmpeg, ffprobe = audio.find_tools()
+        if not (ffmpeg and ffprobe):
+            self.skipTest("ffmpeg not installed")
+        lavfi = [ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10", "-t", "1"]
+        # the source: SD with no colour tags; the output: what Jasna 0.12.3 writes for it, tagged BT.709
+        made = subprocess.run([*lavfi, "-c:v", "mpeg4", self.src], capture_output=True, text=True)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        out = os.path.join(self.tmp, "jasna-out.mp4")
+        made = subprocess.run([*lavfi, "-c:v", "libx264", "-colorspace", "bt709", "-color_primaries", "bt709",
+                               "-color_trc", "bt709", out], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest(f"ffmpeg cannot make the fixture: {made.stderr.strip()[-200:]}")
+        self.assertTrue(audio.untagged_sd(self.src, ffprobe))
+        self.assertIsNone(audio.fix_output(out, "", ffmpeg, ffprobe))               # not asked: left alone
+        result = audio.fix_output(out, "", ffmpeg, ffprobe, "", source_sd_untagged=True)
+        self.assertTrue(result and result["colour"], result)
+        self.assertEqual(audio.probe_video(out, ffprobe)["color_space"], "smpte170m")
+        self.assertIsNone(audio.fix_output(out, "", ffmpeg, ffprobe, "", source_sd_untagged=True))   # done once
+        # a tagged source is taken at its word
+        made = subprocess.run([*lavfi, "-c:v", "libx264", "-colorspace", "bt709", "-f", "matroska", self.src],
+                              capture_output=True, text=True)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertFalse(audio.untagged_sd(self.src, ffprobe))
+
+    def test_retarget_is_left_out_for_a_source_mislabelled_high_rate(self):
+        from jasna_bridge import audio
+        ffmpeg, ffprobe = audio.find_tools()
+        if not (ffmpeg and ffprobe):
+            self.skipTest("ffmpeg not installed")
+        # MPEG-4 at a 60 fps time base carrying every other frame: says 60 fps, frames come at 30
+        # (the shape of a WMV with 1 ms timestamps that ffprobe and Jasna read as 59.94)
+        made = subprocess.run([ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=60",
+                               "-t", "4", "-vf", "select=not(mod(n\\,2))", "-fps_mode", "passthrough", "-c:v", "mpeg4",
+                               self.src], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest(f"ffmpeg cannot make the fixture: {made.stderr.strip()[-200:]}")
+        label, measured = audio.mislabelled_high_rate(self.src, ffprobe)
+        self.assertEqual(round(label), 60)
+        self.assertAlmostEqual(measured, 30, delta=0.5)
+        st, body, _ = self.submit(flags=["--fake-delay", "0.2", "--fake-passthrough", "--retarget-high-fps"])
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertNotIn("--retarget-high-fps", job["command"])
+        self.assertTrue(any(n.startswith("--retarget-high-fps left out") for n in job["notes"]), job["notes"])
+        # a real 60 fps source keeps the flag
+        made = subprocess.run([ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=60",
+                               "-t", "4", "-c:v", "mpeg4", self.src], capture_output=True, text=True)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertIsNone(audio.mislabelled_high_rate(self.src, ffprobe))
+        st, body, _ = self.submit(flags=["--fake-delay", "0.2", "--fake-passthrough", "--retarget-high-fps"],
+                                  preset="other", output_path=self.out.replace("LTX", "other"))
+        self.assertEqual(st, 201, body)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertIn("--retarget-high-fps", job["command"])
+
     def test_broken_edit_list_is_rewritten(self):
         from jasna_bridge import audio
         ffmpeg, ffprobe = audio.find_tools()
@@ -1820,7 +1877,7 @@ class Batch(unittest.TestCase):
         job = self.wait_state(body["job"]["id"], {"done", "failed"})
         self.assertEqual(job["state"], "done", job["error"])
         self.assertFalse(audio.broken_edit_list(out2, ffprobe))
-        self.assertEqual(job["audio_result"], {"edit_list": True, "seconds": job["audio_result"]["seconds"]})
+        self.assertEqual(job["audio_result"], {"edit_list": True, "colour": False, "seconds": job["audio_result"]["seconds"]})
 
     def test_disabled_bridge_answers_404(self):
         plain = BridgeHarness()

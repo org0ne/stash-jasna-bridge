@@ -518,10 +518,10 @@ class JobQueue:
         out_tmp = os.path.join(self.scratch_dir, f"{job.id}{OUTPUT_EXT}")
         work = os.path.join(self.scratch_dir, f"work-{job.id}")
         job.log_file = os.path.join(self.log_dir, f"{job.id}.log")
+        flags = self._jasna_flags(job, [*cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags])
         cmd = [*shlex.split(cfg.batch_wrapper), cfg.jasna_binary,
                "--input", job.source, "--output", out_tmp, "--working-directory", work,
-               *([] if cfg.batch_progress else ["--no-progress"]),
-               *cfg.jasna_common_flags, *cfg.batch_common_flags, *job.flags]
+               *([] if cfg.batch_progress else ["--no-progress"]), *flags]
         with self.lock:
             job.state, job.started, job.attempts, job.head = "running", time.time(), job.attempts + 1, False
             job.command, job.error, job.exit_code, job.progress, job.pid = cmd, "", None, None, None
@@ -617,6 +617,34 @@ class JobQueue:
             return self._finish(job, "failed", f"output copy to {job.output} came up short; result left at {out_tmp}")
         self._finish(job, "done", "")
 
+    RETARGET_FLAG = "--retarget-high-fps"
+
+    def _jasna_flags(self, job: Job, flags: list[str]) -> list[str]:
+        """The job's flags, less --retarget-high-fps when the source only
+        says it is 50-60 fps: Jasna goes by the container rate and would
+        keep every other frame of a 29.97 fps file (WMVs with 1 ms
+        timestamps read as 59.94). Without the flag Jasna keeps every frame
+        and the source's timing (checked on DV-1400.wmv, 2026-11-14)."""
+        if self.RETARGET_FLAG not in flags or not os.path.isfile(job.source):
+            return flags
+        _, ffprobe = audio_fix.find_tools(self.cfg.batch_ffmpeg)
+        if not ffprobe:
+            return flags
+        try:
+            wrong = audio_fix.mislabelled_high_rate(job.source, ffprobe)
+        except audio_fix.AudioError as err:
+            log.warning("job %s: source frame rate not checked: %s", job.id, err)
+            return flags
+        if not wrong:
+            return flags
+        note = (f"{self.RETARGET_FLAG} left out: the source says {wrong[0]:.2f} fps but its frames come at "
+                f"{wrong[1]:.2f} fps, so Jasna would drop every other frame")
+        log.info("job %s: %s", job.id, note)
+        with self.lock:
+            if note not in job.notes:
+                job.notes.append(note)
+        return [f for f in flags if f != self.RETARGET_FLAG]
+
     def _fix_output(self, job: Job, out_tmp: str) -> None:
         """One stream-copy remux of the finished file when its audio is not
         job.audio (Jasna copies the source stream) or its edit list is
@@ -630,7 +658,12 @@ class JobQueue:
                 log.warning("job %s: ffmpeg/ffprobe not found; audio not converted to %s", job.id, job.audio)
             return
         try:
-            result = audio_fix.fix_output(out_tmp, job.audio, ffmpeg, ffprobe, job.log_file)
+            sd_untagged = audio_fix.untagged_sd(job.source, ffprobe)
+        except audio_fix.AudioError as err:
+            log.warning("job %s: source colour not checked: %s", job.id, err)
+            sd_untagged = False
+        try:
+            result = audio_fix.fix_output(out_tmp, job.audio, ffmpeg, ffprobe, job.log_file, sd_untagged)
         except audio_fix.AudioError as err:
             log.warning("job %s: output left as Jasna wrote it: %s", job.id, err)
             with self.lock:
@@ -645,9 +678,12 @@ class JobQueue:
                                  f"({result['channels']}ch, ffmpeg {result['seconds']}s)")
             if result.get("edit_list"):
                 job.notes.append(f"edit list rewritten (stream-copy remux, {result['seconds']}s)")
-        log.info("job %s: output fixed in %.0fs: %s%s", job.id, result["seconds"],
-                 f"audio {result['from']} -> {result['to']}" if result.get("from") else "",
-                 (", " if result.get("from") else "") + "edit list rewritten" if result.get("edit_list") else "")
+            if result.get("colour"):
+                job.notes.append("colour tag BT.709 -> BT.601: the source is untagged SD, its pixels are BT.601")
+        done = ([f"audio {result['from']} -> {result['to']}"] if result.get("from") else []) + \
+            (["edit list rewritten"] if result.get("edit_list") else []) + \
+            (["colour tag BT.709 -> BT.601"] if result.get("colour") else [])
+        log.info("job %s: output fixed in %.0fs: %s", job.id, result["seconds"], ", ".join(done))
 
     def _adopt_running(self, job: Job, pid: int) -> None:
         """Watch a Jasna left running by the previous bridge until it exits,

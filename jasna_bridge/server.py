@@ -51,6 +51,7 @@ ROUTES = [
     ("DELETE", re.compile(rf"^/jobs/{JOB_RE}$"), "job_delete", True),
     ("POST", re.compile(rf"^/jobs/{JOB_RE}/ack$"), "job_ack", True),
     ("POST", re.compile(rf"^/jobs/{JOB_RE}/move$"), "job_move", True),
+    ("POST", re.compile(rf"^/jobs/{JOB_RE}/retry$"), "job_retry", True),
     ("GET", re.compile(rf"^/jobs/{JOB_RE}/log$"), "job_log", True),
 ]
 
@@ -310,6 +311,11 @@ class Handler(BaseHTTPRequestHandler):
         body = self.read_json()
         job = jobs.move(job_id, str(body.get("before") or "") or None, str(body.get("after") or "") or None)
         self.send_json(HTTPStatus.OK, {"job": job.public(), "queued": [j.id for j in jobs.queued()]})
+
+    def h_job_retry(self, job_id: str):
+        jobs = self.jobs_or_404()
+        job = jobs.retry(job_id)
+        self.send_json(HTTPStatus.OK, {"job": job.public(), "position": len(jobs.queued())})
 
     def h_job_log(self, job_id: str):
         text = self.jobs_or_404().log_tail(job_id)

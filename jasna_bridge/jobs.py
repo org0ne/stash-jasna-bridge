@@ -307,6 +307,34 @@ class JobQueue:
                 return job
             raise JobError(f"job is already {job.state}", 409)
 
+    def retry(self, job_id: str) -> Job:
+        """Put a failed job back on the queue, at the end, as a fresh run:
+        same id, source, preset and flags, its attempts and acknowledgement
+        cleared so the plugin's Sync tags the scene Queued again."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise JobError("no such job", 404)
+            if job.state != "failed":
+                raise JobError(f"job is {job.state}; only failed jobs can be retried", 409)
+            for j in self.jobs.values():
+                if j.state in ACTIVE and j.source == job.source and j.preset == job.preset:
+                    raise JobError("an identical job is already queued or running", 409, job=j.public())
+            if not os.path.isfile(job.source):
+                raise JobError(f"source file not visible to the bridge: {job.source}", 404)
+            job.notes.append(f"retried after: {job.error}" if job.error else "retried")
+            job.state, job.started, job.finished, job.duration_s = "queued", None, None, None
+            job.exit_code, job.error, job.progress, job.pid, job.head = None, "", None, None, False
+            job.attempts, job.ingested, job.output_bytes, job.audio_result = 0, False, None, None
+            job.rank = time.time()   # the end of the queue, like a new submission
+            job.created = job.rank
+        self._discard_scratch(job)
+        self._save()
+        log.info("job %s: retried, queued again", job.id)
+        self._notify(job, "retried")
+        self._wake.set()
+        return job
+
     def move(self, job_id: str, before: str | None = None, after: str | None = None) -> Job:
         """Put a queued job just before or just after another queued job
         (the queue page's drag). Anchoring on a job, not a position, keeps

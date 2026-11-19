@@ -100,7 +100,7 @@
   .more { margin: 2px 0 0; }
   .foot { margin-top: 24px; font-size: 12px; color: var(--muted); }
   .foot a { color: inherit; }
-  .acts { display: flex; gap: 6px; }
+  .acts { display: flex; gap: 6px; align-items: center; }
   @media (max-width: 480px) { .row { grid-template-columns: auto 1fr; } .row > .acts, .row > a.log { grid-column: 2; justify-self: start; } }
 </style>
 </head>
@@ -227,8 +227,12 @@
     try { await post(NODES[key], "batch/resume"); } catch (e) { alert(e.message); }
     refresh();
   }
+  async function retry(key, id) {
+    try { await post(NODES[key], `jobs/${id}/retry`); } catch (e) { alert(e.message); }
+    refresh();
+  }
   function showAll(key) { expanded.add(key); $("nodes").innerHTML = NODES.map(renderNode).join(""); }
-  window.__cancel = cancel; window.__pause = pause; window.__resume = resume; window.__showAll = showAll;
+  window.__cancel = cancel; window.__pause = pause; window.__resume = resume; window.__showAll = showAll; window.__retry = retry;
 
   // Progress as one bar per pass: finished passes full, the current one
   // filled to Jasna's percent for it, the rest empty. Jasna's own bar
@@ -281,9 +285,12 @@
     const cls = st === "done" ? "ok" : st === "running" ? "run" : st === "queued" ? "" : st === "failed" ? "bad" : "warn";
     const top = st === "queued" && pos > 1
       ? `<button onclick="__toTop(${node.key},'${j.id}')" title="Run this job next: move it to the top of the queue">↑ Top</button>` : "";
+    const log = j.log_file ? `<a class="log" href="${esc(node.base)}jobs/${j.id}/log" target="_blank">log</a>` : "";
     const action = (st === "queued" || st === "running")
       ? `<span class="acts">${top}<button class="danger" onclick="__cancel(${node.key},'${j.id}','${st}')">${st === "running" ? "Stop" : "Remove"}</button></span>`
-      : (j.log_file ? `<a class="log" href="${esc(node.base)}jobs/${j.id}/log" target="_blank">log</a>` : "");
+      : st === "failed"
+      ? `<span class="acts">${log}<button class="primary" onclick="__retry(${node.key},'${j.id}')" title="Queue this job again, at the end of ${node.name ? esc(node.name) + "'s" : "the"} queue">Retry</button></span>`
+      : log;
     const nodeChip = multi && pos == null && st !== "running" ? `<span class="chip">${esc(node.name)}</span>` : "";
     const head = st === "queued" && j.head ? " · back at the head after a pause" : "";
     const posCell = grip ? `<span class="pos grip" title="Drag to reorder"><i></i>${pos}</span>`

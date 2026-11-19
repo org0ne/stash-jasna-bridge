@@ -1579,6 +1579,36 @@ class Batch(unittest.TestCase):
         st, body, _ = self.h.call("POST", f"/jobs/{d}/move", {"before": a})
         self.assertEqual(st, 409, body)   # finished jobs are not movable
 
+    def test_retry_requeues_a_failed_job(self):
+        st, a, _ = self.submit(flags=["--fake-fail", "3"])
+        a = a["job"]["id"]
+        job = self.wait_state(a, {"failed", "done"})
+        self.assertEqual(job["state"], "failed")
+        self.h.call("POST", f"/jobs/{a}/ack")
+        self.h.call("POST", "/batch/pause", {})
+        st, b, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"))
+        st, body, _ = self.h.call("POST", f"/jobs/{a}/retry")
+        self.assertEqual(st, 200, body)
+        job = body["job"]
+        self.assertEqual(job["state"], "queued"); self.assertEqual(body["position"], 2)   # behind b
+        self.assertFalse(job["ingested"]); self.assertEqual(job["attempts"], 0); self.assertEqual(job["error"], "")
+        self.assertIsNone(job["finished"]); self.assertIn("retried after", job["notes"][-1])
+        self.assertIn("retried", [t["args"].get("event") for t in self.tasks_seen() if "args" in t])
+        st, body, _ = self.h.call("POST", f"/jobs/{a}/retry")
+        self.assertEqual(st, 409, body)                        # queued now, not failed
+        st, body, _ = self.h.call("POST", f"/jobs/{b['job']['id']}/retry")
+        self.assertEqual(st, 409, body)
+        st, body, _ = self.h.call("POST", f"/jobs/{'0' * 12}/retry")
+        self.assertEqual(st, 404, body)
+        self.h.call("POST", "/batch/resume")
+        job = self.wait_state(a, {"failed", "done"}, timeout=20)
+        self.assertEqual(job["state"], "failed"); self.assertEqual(job["attempts"], 1)   # ran again
+        # not while an identical job is active
+        st, c, _ = self.submit(flags=["--fake-delay", "3"])
+        st, body, _ = self.h.call("POST", f"/jobs/{a}/retry")
+        self.assertEqual(st, 409, body); self.assertEqual(body["job"]["id"], c["job"]["id"])
+        self.h.call("DELETE", f"/jobs/{c['job']['id']}")
+
     def test_queue_order_from_an_older_state_file(self):
         # Before ranks: a job put back by a pause (head) first, then by submission.
         self.h.jobs.shutdown()
@@ -1715,6 +1745,7 @@ class Batch(unittest.TestCase):
         self.assertIn(b'api(node, "jobs")', body)       # relative, so the path prefix does not matter
         self.assertIn(b'`jobs/${id}/move`', body)       # queued jobs are dragged into a new order
         self.assertIn(b'__toTop(', body)                 # or sent to the top with one button
+        self.assertIn(b'`jobs/${id}/retry`', body)      # a failed job is queued again with one button
         plain = BridgeHarness()
         try:
             st, body, _ = plain.call("GET", "/queue")

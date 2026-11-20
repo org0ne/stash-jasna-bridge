@@ -80,7 +80,7 @@ All paths are also accepted under `server.path_prefix` (default `/jasna`).
 | GET | `/jobs[?state=queued,running&unacknowledged=1]` | job list |
 | GET / DELETE | `/jobs/{id}` | one job / cancel it (a running one is killed) |
 | POST | `/jobs/{id}/move` | `{"before": "<job id>"}` or `{"after": "<job id>"}`: put a queued job next to another queued job → `{job, queued}` (the new order); **409** when either is not queued. Persisted |
-| POST | `/jobs/{id}/retry` | put a failed job back at the end of the queue as a fresh run (same id; attempts, error and `ingested` cleared; the plugin's *Sync* is run with event `retried`) → `{job, position}`; **409** when it is not failed or an identical job is queued or running |
+| POST | `/jobs/{id}/retry` | put a failed job back at the end of the queue as a fresh run (same id; attempts, error and `ingested` cleared; the plugin's *Sync* is run with event `retried`) → `{job, position}`; **409** when it is not failed, its output already exists, or an identical job is queued or running |
 | POST | `/jobs/{id}/ack` | the plugin has ingested the result; optional body `{"scene_id"}` = the Stash scene made from the output (`result_scene_id`, which the queue page links a done job to) |
 | GET | `/jobs/{id}/log` | tail of Jasna's output for the job (text) |
 | GET | `/batch`, `/batch/check` | queue snapshot (`paused`, `paused_since`, `running`, `queued`, ...) / environment checks for the plugin's *Check settings* task |
@@ -255,7 +255,8 @@ optional `[[paths.map]]` rewrites.
   it, and a job that was running is re-queued (partial output discarded)
   up to `batch.max_attempts` times. Free space on scratch and on the output
   volume is checked before each run (`batch.min_free_gb`, and twice the
-  source size). Jasna's interactive prompts are never answered: a preset
+  source size), and a job whose output file already exists (made by
+  another job since it was queued) fails at once, without running. Jasna's interactive prompts are never answered: a preset
   naming a model that is not downloaded fails at Jasna's download prompt,
   which `GET /batch/check` (and the plugin's *Check settings*) warns about
   for LTX.

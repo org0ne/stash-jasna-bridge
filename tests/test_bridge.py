@@ -1608,6 +1608,12 @@ class Batch(unittest.TestCase):
         st, body, _ = self.h.call("POST", f"/jobs/{a}/retry")
         self.assertEqual(st, 409, body); self.assertEqual(body["job"]["id"], c["job"]["id"])
         self.h.call("DELETE", f"/jobs/{c['job']['id']}")
+        # nor once its output exists (another job made it)
+        self.wait_state(c["job"]["id"], {"cancelled"})
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        open(self.out, "w").close()
+        st, body, _ = self.h.call("POST", f"/jobs/{a}/retry")
+        self.assertEqual(st, 409, body); self.assertIn("output already exists", body["error"])
 
     def test_queue_order_from_an_older_state_file(self):
         # Before ranks: a job put back by a pause (head) first, then by submission.
@@ -1630,17 +1636,27 @@ class Batch(unittest.TestCase):
         st, body, _ = self.submit(flags=["--fake-no-output"], preset="noout", output_path=self.out.replace("LTX", "noout"))
         job = self.wait_state(body["job"]["id"], {"done", "failed"})
         self.assertEqual(job["state"], "failed"); self.assertIn("no output", job["error"])
-        # an output that appeared meanwhile is never overwritten
+        # an output that appeared during the run is never overwritten
+        st, body, _ = self.submit(preset="again", output_path=self.out, flags=["--fake-delay", "1"])
+        self.wait_state(body["job"]["id"], {"running"})
+        for _ in range(50):   # "running" comes before the checks; a pid after them
+            if self.h.call("GET", f"/jobs/{body['job']['id']}")[1]["job"]["pid"]:
+                break
+            time.sleep(0.05)
         os.makedirs(os.path.dirname(self.out), exist_ok=True)
         with open(self.out, "wb") as fh:
             fh.write(b"someone else's")
-        st, body, _ = self.submit(preset="again", output_path=self.out)
         job = self.wait_state(body["job"]["id"], {"done", "failed"})
-        self.assertEqual(job["state"], "failed"); self.assertIn("already exists", job["error"])
+        self.assertEqual(job["state"], "failed"); self.assertIn("result left at", job["error"])
         with open(self.out, "rb") as fh:
             self.assertEqual(fh.read(), b"someone else's")
+        # and a job whose output exists before it starts is not run at all
+        st, body, _ = self.submit(preset="third", output_path=self.out)
+        job = self.wait_state(body["job"]["id"], {"done", "failed"})
+        self.assertEqual(job["state"], "failed"); self.assertIn("not run", job["error"])
+        self.assertFalse(os.path.exists(job["log_file"]))   # Jasna never started
         events = [t["args"]["event"] for t in self.tasks_seen()]
-        self.assertEqual(events.count("failed"), 3)
+        self.assertEqual(events.count("failed"), 4)
 
     def test_submit_validation(self):
         st, body, _ = self.submit(flags=["--output", "/x"])

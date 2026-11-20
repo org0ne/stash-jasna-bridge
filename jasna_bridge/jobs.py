@@ -322,6 +322,10 @@ class JobQueue:
                     raise JobError("an identical job is already queued or running", 409, job=j.public())
             if not os.path.isfile(job.source):
                 raise JobError(f"source file not visible to the bridge: {job.source}", 404)
+            if os.path.exists(job.output):
+                # Another job made it since (BUR-144, 2026-11-20: a 99-minute retry
+                # of a job redone and ingested ten days earlier, refused at the move).
+                raise JobError(f"output already exists: {job.output}; nothing to retry", 409)
             job.notes.append(f"retried after: {job.error}" if job.error else "retried")
             job.state, job.started, job.finished, job.duration_s = "queued", None, None, None
             job.exit_code, job.error, job.progress, job.pid, job.head = None, "", None, None, False
@@ -812,6 +816,9 @@ class JobQueue:
         cfg = self.cfg
         if not os.path.isfile(job.source):
             return f"source file is gone: {job.source}"
+        if os.path.exists(job.output):
+            # Made by another job since this one was queued; the move would refuse it after the whole run.
+            return f"output already exists: {job.output}; not run"
         try:
             os.makedirs(self.scratch_dir, exist_ok=True)
         except OSError as err:

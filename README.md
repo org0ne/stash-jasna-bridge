@@ -279,6 +279,23 @@ optional `[[paths.map]]` rewrites.
   with event `requeued`, and the jasna-batch plugin sends new jobs to
   another node while this one is paused. The `/queue` page has the
   buttons, one set per node.
+- **GPU check before every job.** `nvidia-smi` only reads driver
+  counters and can keep answering after the GPU has locked up: on
+  2026-11-25 the RTX 4090 hit Xid 38 as one LTX job ended, the driver's
+  RC watchdog reported "GPU is probably locked!" from then on, and the
+  next job was started into the dead card and hung in the kernel for 12
+  hours. So before handing the GPU to a job the bridge runs a small probe
+  (`gpucheck.py`, the CUDA driver API via ctypes, about 0.3 s): create a
+  context, set 1 MiB of device memory, wait for the GPU. A probe that
+  fails, or takes longer than `batch.gpu_check_timeout_s` (30 s), pauses
+  the queue instead: the job stays first and is not counted as an
+  attempt, the reason is in the log, in `/health` and `/batch` as
+  `gpu_fault` (kept across a restart with the pause), and on the `/queue`
+  page. The probe runs in its own process, so a probe stuck in the
+  kernel only strands itself. A locked GPU needs a reboot (on a VM, reset
+  it from the host if the reboot stalls on the NVIDIA driver's shutdown);
+  *Resume* clears the fault. `/batch/check` runs the same probe.
+  `batch.gpu_check = false` turns it off.
 - **Queue order.** Jobs run lowest `rank` first; a job's rank is its
   submission time until `POST /jobs/{id}/move` (the `/queue` page's
   drag) renumbers the queued jobs 0, 1, 2 ..., so later submissions still

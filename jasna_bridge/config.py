@@ -113,6 +113,8 @@ class Config:
     batch_keep_running_on_restart: bool = True  # a bridge stop leaves the running Jasna alone; the next bridge
                                      # start adopts it (needs KillMode=process in the unit)
     batch_ffmpeg: str = ""           # ffmpeg for the audio fix-up of finished outputs (audio.py); blank: on PATH
+    batch_gpu_check: bool = True     # run a small CUDA probe before every job; a GPU that fails it pauses the queue
+    batch_gpu_check_timeout_s: float = 30.0   # (gpucheck.py) how long the probe may take
 
     # [gpu]: whole-GPU load sampled with nvidia-smi for the queue page's
     # sparkline (gpu.py). Off automatically where nvidia-smi is missing.
@@ -274,6 +276,8 @@ def from_dict(data: dict) -> Config:
     cfg.batch_progress = _get(batch, "progress", cfg.batch_progress)
     cfg.batch_keep_running_on_restart = _get(batch, "keep_running_on_restart", cfg.batch_keep_running_on_restart)
     cfg.batch_ffmpeg = _get(batch, "ffmpeg", cfg.batch_ffmpeg)
+    cfg.batch_gpu_check = _get(batch, "gpu_check", cfg.batch_gpu_check)
+    cfg.batch_gpu_check_timeout_s = _get(batch, "gpu_check_timeout_s", cfg.batch_gpu_check_timeout_s)
     gpu = data.get("gpu", {})
     cfg.gpu_sample = _get(gpu, "sample", cfg.gpu_sample)
     cfg.gpu_sample_seconds = _get(gpu, "sample_seconds", cfg.gpu_sample_seconds)

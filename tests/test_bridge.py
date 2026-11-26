@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 
@@ -139,6 +140,8 @@ class BridgeHarness:
         if self.cfg.batch_enabled:
             self.jobs = JobQueue(self.cfg, self.sessions, stash, lambda p: config.map_path(self.cfg, p))
             self.jobs.POLL_S = 0.2
+            self.gpu_ok = True   # what the stand-in for the CUDA probe answers
+            self.jobs.gpu_probe = lambda timeout_s: (True, "ok") if self.gpu_ok else (False, "CUDA probe failed (exit 2): cuCtxCreate_v2 failed: CUDA_ERROR_LAUNCH_TIMEOUT")
             self.jobs.start()
         self.gpu = GpuSampler(self.cfg)
         self.gpu.start()
@@ -1514,6 +1517,37 @@ class Batch(unittest.TestCase):
         self.assertEqual(st, 200); self.assertFalse(body["batch"]["paused"])
         self.wait_state(b["job"]["id"], {"done"})
 
+    def test_gpu_fault_pauses_the_queue_and_keeps_the_job_first(self):
+        self.h.gpu_ok = False
+        st, a, _ = self.submit()
+        deadline = time.time() + 5
+        while time.time() < deadline and not self.h.call("GET", "/health")[1]["batch"]["paused"]:
+            time.sleep(0.1)
+        st, body, _ = self.h.call("GET", "/health")
+        fault = body["batch"]["gpu_fault"]
+        self.assertTrue(body["batch"]["paused"]); self.assertEqual(fault["job"], a["job"]["id"])
+        self.assertIn("CUDA_ERROR_LAUNCH_TIMEOUT", fault["detail"])
+        st, body, _ = self.h.call("GET", f"/jobs/{a['job']['id']}")
+        self.assertEqual(body["job"]["state"], "queued"); self.assertEqual(body["job"]["attempts"], 0)
+        self.assertIsNone(self.h.call("GET", "/health")[1]["batch_job"])   # the GPU was given back
+        # the reason survives a bridge restart, with the pause
+        reloaded = JobQueue(self.h.cfg, self.h.sessions, self.h.jobs.stash, self.h.jobs.map_path)
+        reloaded._load()
+        self.assertTrue(reloaded.paused); self.assertEqual(reloaded.gpu_fault, fault)
+        self.h.gpu_ok = True
+        st, body, _ = self.h.call("POST", "/batch/resume")
+        self.assertIsNone(body["batch"]["gpu_fault"])
+        self.assertEqual(self.wait_state(a["job"]["id"], {"done", "failed"})["state"], "done")
+
+    def test_check_reports_the_cuda_probe(self):
+        st, body, _ = self.h.call("GET", "/batch/check")
+        probe = next(c for c in body["checks"] if c["label"] == "GPU runs CUDA work")
+        self.assertTrue(probe["ok"]); self.assertIn("1 MiB memset", probe["detail"])
+        self.h.gpu_ok = False
+        st, body, _ = self.h.call("GET", "/batch/check")
+        probe = next(c for c in body["checks"] if c["label"] == "GPU runs CUDA work")
+        self.assertFalse(probe["ok"]); self.assertIn("cuCtxCreate_v2", probe["detail"])
+
     def test_pause_now_stops_the_running_job_and_requeues_it_first(self):
         st, older, _ = self.submit(preset="other", output_path=self.out.replace("LTX", "other"),
                                    flags=["--fake-delay", "5"])
@@ -2007,3 +2041,19 @@ class Batch(unittest.TestCase):
         self.assertEqual(again.jobs[job_id].state, "failed")
         self.assertIn("giving up", again.jobs[job_id].error)
         self.h.jobs = None  # already shut down
+
+
+class GpuProbe(unittest.TestCase):
+    def test_a_probe_that_never_answers_times_out_without_blocking(self):
+        from jasna_bridge import gpucheck
+        with unittest.mock.patch.object(gpucheck, "PROBE", "import time; time.sleep(30)"):
+            started = time.time()
+            ok, detail = gpucheck.probe(0.5)
+        self.assertFalse(ok); self.assertIn("within 0.5s", detail)
+        self.assertLess(time.time() - started, 5)
+
+    def test_a_failing_probe_names_the_cuda_error(self):
+        from jasna_bridge import gpucheck
+        with unittest.mock.patch.object(gpucheck, "PROBE", "print('cuInit failed: CUDA_ERROR_NO_DEVICE'); raise SystemExit(2)"):
+            ok, detail = gpucheck.probe(10)
+        self.assertFalse(ok); self.assertIn("CUDA_ERROR_NO_DEVICE", detail)

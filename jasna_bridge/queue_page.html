@@ -366,6 +366,7 @@
     const live = health.active ? "live stream active" : (health.stream && health.stream.path) ? "stream lingering" : "";
     let text, cls;
     if (!b.enabled) { text = "batch disabled"; cls = "bad"; }
+    else if (b.paused && b.gpu_fault) { text = "paused · GPU fault"; cls = "bad"; }
     else if (b.paused) { text = running.length ? "paused · finishing the running job" : "paused"; cls = "warn"; }
     else if (running.length) { text = "processing"; cls = "run"; }
     else if (queued.length) { text = live ? `waiting: ${live}` : "waiting for the GPU"; cls = "warn"; }
@@ -375,6 +376,7 @@
     if (info.jasna_version) meta.push(`Jasna ${info.jasna_version}`);
     if (b.scratch_free_gb != null) meta.push(`${Math.round(b.scratch_free_gb)} GB scratch free`);
     if (b.paused && b.paused_since) meta.push(`paused since ${fmtTime(b.paused_since)}`);
+    if (b.paused && b.gpu_fault) meta.push(`${b.gpu_fault.detail}; reboot the host, then Resume`);
     if (live && b.paused) meta.push(live);
     let ctl = "";
     if (b.enabled) {

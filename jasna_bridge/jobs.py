@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass, field
 from .config import validate_custom_preset
 from .stash import StashError
 from . import audio as audio_fix
+from . import gpucheck
 
 log = logging.getLogger("bridge.jobs")
 
@@ -118,6 +119,8 @@ class JobQueue:
         self._requeue_requested: set[str] = set()   # running jobs to stop and put back at the head (pause)
         self.paused = False            # start no job while set; persisted with the queue
         self.paused_since: float | None = None
+        self.gpu_fault: dict | None = None   # why the GPU check paused the queue; cleared on resume
+        self.gpu_probe = gpucheck.probe
         self._adopt: list[tuple[Job, int]] = []   # running jobs found alive at start, (job, pid)
         self._save_lock = threading.Lock()        # one writer of the state file at a time
         self._stop = threading.Event()
@@ -195,6 +198,7 @@ class JobQueue:
         self.stats.update({k: v for k, v in data.get("stats", {}).items() if k in self.stats})
         self.paused = bool(data.get("paused"))
         self.paused_since = data.get("paused_since") if self.paused else None
+        self.gpu_fault = data.get("gpu_fault") if self.paused else None
 
     def _save(self) -> None:
         with self.lock:
@@ -205,7 +209,7 @@ class JobQueue:
                 for j in finished[: len(finished) - self.cfg.batch_keep_jobs]:
                     del self.jobs[j.id]
             data = {"jobs": [asdict(j) for j in self.jobs.values()], "stats": dict(self.stats),
-                    "paused": self.paused, "paused_since": self.paused_since}
+                    "paused": self.paused, "paused_since": self.paused_since, "gpu_fault": self.gpu_fault}
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         tmp = self.state_file + ".tmp"
         with self._save_lock:
@@ -234,6 +238,7 @@ class JobQueue:
                 "enabled": True,
                 "paused": self.paused,
                 "paused_since": self.paused_since,
+                "gpu_fault": self.gpu_fault,
                 "running": cur.brief() if cur else None,
                 "queued": len([j for j in self.jobs.values() if j.state == "queued"]),
                 "unacknowledged": len([j for j in self.jobs.values()
@@ -398,6 +403,7 @@ class JobQueue:
 
     def resume(self) -> dict:
         with self.lock:
+            self.gpu_fault = None
             if self.paused:
                 self.paused, self.paused_since = False, None
                 log.info("batch queue resumed (%d queued)", len([j for j in self.jobs.values() if j.state == "queued"]))
@@ -498,6 +504,10 @@ class JobQueue:
                 add("NVIDIA GPU", False, "nvidia-smi did not answer")
         else:
             add("NVIDIA GPU", False, "nvidia-smi not found")
+        started = time.time()
+        ok, detail = self.gpu_probe(cfg.batch_gpu_check_timeout_s)
+        add("GPU runs CUDA work", ok, f"1 MiB memset in {time.time() - started:.1f}s"
+            + ("" if cfg.batch_gpu_check else "; batch.gpu_check is off, jobs start unchecked") if ok else detail)
         try:
             self.stash.graphql("{ version { version } }")
             add("Stash reachable from the bridge", True, cfg.stash_url)
@@ -535,6 +545,8 @@ class JobQueue:
                 self._wake.clear()
                 continue
             try:
+                if not self._gpu_ok(job):
+                    continue
                 self._run(job)
             except Exception as err:  # never let the worker die
                 log.exception("job %s: unexpected error", job.id)
@@ -544,6 +556,24 @@ class JobQueue:
 
     def _acquire_gpu(self, job: Job) -> bool:
         return self.sessions.batch_acquire(job.brief(), self.cfg.batch_grace_s)
+
+    def _gpu_ok(self, job: Job) -> bool:
+        """Probe the GPU before giving it a job (gpucheck.py). A GPU that
+        fails pauses the queue with the reason, and the job stays first: on
+        2026-11-25 a job started into a GPU locked since the end of the one
+        before hung for 12 hours."""
+        if not self.cfg.batch_gpu_check:
+            return True
+        ok, detail = self.gpu_probe(self.cfg.batch_gpu_check_timeout_s)
+        if ok:
+            return True
+        with self.lock:
+            self.paused, self.paused_since = True, time.time()
+            self.gpu_fault = {"at": self.paused_since, "detail": detail, "job": job.id}
+        log.error("job %s not started and the batch queue paused: %s. Reboot the host (reset the VM if the "
+                  "reboot stalls), then resume the queue.", job.id, detail)
+        self._save()
+        return False
 
     def _run(self, job: Job) -> None:
         cfg = self.cfg

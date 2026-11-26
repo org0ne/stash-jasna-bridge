@@ -98,3 +98,7 @@ ffmpeg = ""                 # for the output fix-up before the move: a job submi
                             #   edit list (Jasna 0.11.3, constant lip-sync offset) is stream-copy remuxed;
                             #   blank: ffmpeg/ffprobe on PATH
                             #   (the unit must have KillMode=process, as deploy/stash-jasna-bridge.service does)
+gpu_check = true            # before every job, a small CUDA probe (context, 1 MiB memset, sync); a GPU that
+                            #   fails it or takes longer than gpu_check_timeout_s pauses the queue with the
+                            #   reason instead of starting the job into a locked card
+gpu_check_timeout_s = 30
